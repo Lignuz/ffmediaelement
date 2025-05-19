@@ -9,7 +9,7 @@
     </When>
     <Otherwise>
       <PropertyGroup>
-        <TargetFrameworks>net8.0-windows;net48</TargetFrameworks>
+        <TargetFrameworks>net8.0-windows</TargetFrameworks>
       </PropertyGroup>
     </Otherwise>
   </Choose>
