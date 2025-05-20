@@ -81,6 +81,32 @@
         }).ConfigureAwait(true);
 
         /// <summary>
+        /// 지정된 시간 이전 또는 해당 시간의 가장 가까운 키프레임으로 빠르게 탐색합니다.
+        /// 프레임 정확도가 필요 없는 빠른 이동에 적합합니다.
+        /// </summary>
+        /// <param name="target">탐색할 대상 시간 (가장 가까운 키프레임 기준).</param>
+        /// <returns>대기 가능한 명령 결과입니다.</returns>
+        public ConfiguredTaskAwaitable<bool> SeekKeyFrame(TimeSpan target) => Task.Run(async () =>
+        {
+            try { return await MediaCore.SeekKeyFrame(target).ConfigureAwait(false); }
+            catch (Exception ex) { PostMediaFailedEvent(ex); }
+            return false;
+        }).ConfigureAwait(true);
+
+        /// <summary>
+        /// 지정된 시간에 정확히 도달하도록 탐색을 수행합니다.
+        /// 대상 시간 이상에 도달할 때까지 프레임을 디코딩합니다.
+        /// </summary>
+        /// <param name="target">정확히 탐색할 대상 시간입니다.</param>
+        /// <returns>대기 가능한 명령 결과입니다.</returns>
+        public ConfiguredTaskAwaitable<bool> SeekAccurate(TimeSpan target) => Task.Run(async () =>
+        {
+            try { return await MediaCore.SeekAccurate(target).ConfigureAwait(false); }
+            catch (Exception ex) { PostMediaFailedEvent(ex); }
+            return false;
+        }).ConfigureAwait(true);
+
+        /// <summary>
         /// Seeks a single frame forward.
         /// </summary>
         /// <returns>The awaitable command.</returns>

@@ -10,6 +10,12 @@
             /// <summary>Normal seek mode.</summary>
             Normal,
 
+            /// <summary>Key Frame seek mode.</summary>
+            KeyFrame,
+
+            /// <summary>Accurate seek mode.</summary>
+            Accurate,
+
             /// <summary>Stop seek mode.</summary>
             Stop,
 
@@ -17,7 +23,7 @@
             StepForward,
 
             /// <summary>Frame step backward.</summary>
-            StepBackward
+            StepBackward,
         }
 
         /// <summary>

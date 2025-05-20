@@ -112,6 +112,14 @@
         public Task<bool> Seek(TimeSpan position) =>
             Commands.SeekMediaAsync(position);
 
+        // 키프레임으로 탐색
+        public Task<bool> SeekKeyFrame(TimeSpan position) =>
+            Commands.SeekMediaKeyFrameAsync(position);
+
+        // 지정한 시간으로 바로 이동
+        public Task<bool> SeekAccurate(TimeSpan position) =>
+            Commands.SeekMediaAccurateAsync(position);
+
         /// <summary>
         /// Seeks a single frame forward.
         /// </summary>

@@ -5,6 +5,7 @@
     using Diagnostics;
     using Primitives;
     using System;
+    using System.Collections.Generic;
     using System.Runtime.CompilerServices;
     using System.Threading;
     using System.Threading.Tasks;
@@ -211,6 +212,7 @@
                         adjustedSeekTarget = TimeSpan.FromTicks(adjustedSeekTarget.Ticks - targetSkewTicks);
                 }
 
+                // 키 프레임 탐색
                 // Populate frame queues with after-seek operation
                 var firstFrame = MediaCore.Container.Seek(adjustedSeekTarget);
                 if (firstFrame != null)
@@ -229,40 +231,18 @@
                     // reset the render times
                     MediaCore.InvalidateRenderers();
 
-                    // Create the blocks from the obtained seek frames
-                    MediaCore.Blocks[firstFrame.MediaType]?.Add(firstFrame, MediaCore.Container);
-                    hasSeekBlocks = TrySignalBlocksAvailable(targetSeekMode, mainBlocks, targetPosition, hasSeekBlocks);
-
-                    // Decode all available queued packets into the media component blocks
-                    foreach (var mt in all)
+                    // 탐색 모드에 따른 처리
+                    switch (targetSeekMode)
                     {
-                        while (!MediaCore.Blocks[mt].IsFull && !ct.IsCancellationRequested)
-                        {
-                            var frame = MediaCore.Container.Components[mt].ReceiveNextFrame();
-                            if (frame == null) break;
-                            MediaCore.Blocks[mt].Add(frame, MediaCore.Container);
-                            hasSeekBlocks = TrySignalBlocksAvailable(targetSeekMode, mainBlocks, targetPosition, hasSeekBlocks);
-                        }
-                    }
-
-                    // Align to the exact requested position on the main component
-                    while (MediaCore.ShouldReadMorePackets && !ct.IsCancellationRequested && !hasSeekBlocks)
-                    {
-                        // Check if we are already in range
-                        hasSeekBlocks = TrySignalBlocksAvailable(targetSeekMode, mainBlocks, targetPosition, hasSeekBlocks);
-                        if (hasSeekBlocks) break;
-
-                        // Read the next packet
-                        var packetType = MediaCore.Container.Read();
-                        var blocks = MediaCore.Blocks[packetType];
-                        if (blocks == null) continue;
-
-                        // Get the next frame
-                        if (blocks.RangeEndTime.Ticks < targetPosition.Ticks || blocks.IsFull == false)
-                        {
-                            blocks.Add(MediaCore.Container.Components[packetType].ReceiveNextFrame(), MediaCore.Container);
-                            hasSeekBlocks = TrySignalBlocksAvailable(targetSeekMode, mainBlocks, targetPosition, hasSeekBlocks);
-                        }
+                        case SeekMode.KeyFrame:
+                            HandleSeekKeyFrame(firstFrame, all, targetSeekMode, mainBlocks, targetPosition, ct, ref hasSeekBlocks);
+                            break;
+                        case SeekMode.Accurate:
+                            HandleSeekAccurate(targetSeekMode, mainBlocks, targetPosition, ct, ref hasSeekBlocks);
+                            break;
+                        default:
+                            HandleSeekNormal(firstFrame, all, targetSeekMode, mainBlocks, targetPosition, ct, ref hasSeekBlocks);
+                            break;
                     }
                 }
 
@@ -310,6 +290,93 @@
             }
 
             return !hasSeekBlocks;
+        }
+
+        private void HandleSeekKeyFrame(MediaFrame firstFrame, IReadOnlyList<MediaType> all, SeekMode mode, MediaBlockBuffer mainBlocks, TimeSpan targetPosition, CancellationToken ct, ref bool hasSeekBlocks)
+        {
+            // Create the blocks from the obtained seek frames
+            MediaCore.Blocks[firstFrame.MediaType]?.Add(firstFrame, MediaCore.Container);
+            hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+        }
+
+        private void HandleSeekAccurate(SeekMode mode, MediaBlockBuffer mainBlocks, TimeSpan targetPosition, CancellationToken ct, ref bool hasSeekBlocks)
+        {
+            var found = false;
+            MediaFrame candidateFrame = null;
+
+            while (!found && MediaCore.ShouldReadMorePackets && !ct.IsCancellationRequested)
+            {
+                var packetType = MediaCore.Container.Read();
+                var component = MediaCore.Container.Components[packetType];
+                var blocks = MediaCore.Blocks[packetType];
+
+                if (component == null || blocks == null)
+                    continue;
+
+                var frame = component.ReceiveNextFrame();
+                if (frame == null) continue;
+
+                // 정확한 위치 프레임 찾기
+                if (frame.StartTime >= targetPosition)
+                {
+                    blocks.Add(frame, MediaCore.Container);
+                    hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+                    found = true;
+                    break;
+                }
+
+                // fallback 후보 저장 (가장 마지막으로 본 프레임)
+                candidateFrame = frame;
+            }
+
+            // 정확한 위치 프레임이 없었을 경우 fallback 처리
+            if (!found && candidateFrame != null)
+            {
+                var fallbackType = candidateFrame.MediaType;
+                var blocks = MediaCore.Blocks[fallbackType];
+
+                blocks.Add(candidateFrame, MediaCore.Container);
+                hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+            }
+        }
+
+        private void HandleSeekNormal(MediaFrame firstFrame, IReadOnlyList<MediaType> all, SeekMode mode, MediaBlockBuffer mainBlocks, TimeSpan targetPosition, CancellationToken ct, ref bool hasSeekBlocks)
+        {
+            // Create the blocks from the obtained seek frames
+            MediaCore.Blocks[firstFrame.MediaType]?.Add(firstFrame, MediaCore.Container);
+            hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+
+            // Decode all available queued packets into the media component blocks
+            foreach (var mt in all)
+            {
+                while (!MediaCore.Blocks[mt].IsFull && !ct.IsCancellationRequested)
+                {
+                    var frame = MediaCore.Container.Components[mt].ReceiveNextFrame();
+                    if (frame == null) break;
+                    MediaCore.Blocks[mt].Add(frame, MediaCore.Container);
+                    hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+                }
+            }
+
+            // Align to the exact requested position on the main component
+            while (MediaCore.ShouldReadMorePackets && !ct.IsCancellationRequested && !hasSeekBlocks)
+            {
+                // Check if we are already in range
+                hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+                if (hasSeekBlocks) break;
+
+                // Read the next packet
+                var packetType = MediaCore.Container.Read();
+                var blocks = MediaCore.Blocks[packetType];
+                if (blocks == null) continue;
+
+                // Get the next frame
+                if (blocks.RangeEndTime.Ticks < targetPosition.Ticks || blocks.IsFull == false)
+                {
+                    blocks.Add(MediaCore.Container.Components[packetType].ReceiveNextFrame(), MediaCore.Container);
+                    hasSeekBlocks = TrySignalBlocksAvailable(mode, mainBlocks, targetPosition, hasSeekBlocks);
+                }
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

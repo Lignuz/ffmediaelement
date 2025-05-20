@@ -164,6 +164,8 @@ namespace Unosquare.FFME.Commands
         /// <param name="seekTarget">The seek target.</param>
         /// <returns>An awaitable task which contains a boolean result. True means success. False means failure.</returns>
         public Task<bool> SeekMediaAsync(TimeSpan seekTarget) => QueueSeekCommand(seekTarget, SeekMode.Normal);
+        public Task<bool> SeekMediaKeyFrameAsync(TimeSpan seekTarget) => QueueSeekCommand(seekTarget, SeekMode.KeyFrame);
+        public Task<bool> SeekMediaAccurateAsync(TimeSpan seekTarget) => QueueSeekCommand(seekTarget, SeekMode.Accurate);
 
         /// <summary>
         /// Queues a seek operation that steps a single frame forward.
