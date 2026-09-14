@@ -11,9 +11,11 @@ internal abstract class WorkerBase : IWorker
     private readonly object SyncLock = new();
     private readonly Stopwatch CycleClock = new();
     private readonly ManualResetEventSlim WantedStateCompleted = new(true);
+    private readonly ManualResetEventSlim CyclesCompleted = new(true);
 
     private int m_IsDisposed;
     private int m_IsDisposing;
+    private int m_ActiveCycles;
     private int m_WorkerState = (int)WorkerState.Created;
     private int m_WantedWorkerState = (int)WorkerState.Running;
     private CancellationTokenSource TokenSource = new();
@@ -162,7 +164,9 @@ internal abstract class WorkerBase : IWorker
     /// <param name="alsoManaged">Determines if managed resources hsould also be released.</param>
     protected virtual void Dispose(bool alsoManaged)
     {
-        StopAsync().Wait(TimeSpan.FromSeconds(2));
+        // Do not release worker resources while the current cycle is still using them.
+        StopAsync().GetAwaiter().GetResult();
+        CyclesCompleted.Wait();
 
         lock (SyncLock)
         {
@@ -174,6 +178,7 @@ internal abstract class WorkerBase : IWorker
             try { OnDisposing(); } catch { /* Ignore */ }
             CycleClock.Reset();
             WantedStateCompleted.Dispose();
+            CyclesCompleted.Dispose();
             TokenSource.Dispose();
             IsDisposed = true;
             IsDisposing = false;
@@ -209,7 +214,23 @@ internal abstract class WorkerBase : IWorker
     /// Interrupts a cycle or a wait operation.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    protected void Interrupt() => TokenSource.Cancel();
+    protected void Interrupt()
+    {
+        lock (SyncLock)
+        {
+            if (IsDisposed || IsDisposing)
+                return;
+
+            try
+            {
+                TokenSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A wait task can wake after Dispose has released the token source.
+            }
+        }
+    }
 
     /// <summary>
     /// Tries to acquire a cycle for execution.
@@ -240,27 +261,38 @@ internal abstract class WorkerBase : IWorker
     /// </summary>
     protected void ExecuteCyle()
     {
-        lock (SyncLock)
+        Interlocked.Increment(ref m_ActiveCycles);
+        CyclesCompleted.Reset();
+
+        try
         {
-            // Recreate the token source -- applies to cycle logic and delay
-            var ts = TokenSource;
-            if (ts.IsCancellationRequested)
+            lock (SyncLock)
             {
-                TokenSource = new CancellationTokenSource();
-                ts.Dispose();
+                // Recreate the token source -- applies to cycle logic and delay
+                var ts = TokenSource;
+                if (ts.IsCancellationRequested && IsDisposing == false && IsDisposed == false)
+                {
+                    TokenSource = new CancellationTokenSource();
+                    ts.Dispose();
+                }
+            }
+
+            if (WorkerState == WorkerState.Running && IsDisposing == false && IsDisposed == false)
+            {
+                try
+                {
+                    ExecuteCycleLogic(TokenSource.Token);
+                }
+                catch (Exception ex)
+                {
+                    OnCycleException(ex);
+                }
             }
         }
-
-        if (WorkerState == WorkerState.Running)
+        finally
         {
-            try
-            {
-                ExecuteCycleLogic(TokenSource.Token);
-            }
-            catch (Exception ex)
-            {
-                OnCycleException(ex);
-            }
+            if (Interlocked.Decrement(ref m_ActiveCycles) == 0)
+                CyclesCompleted.Set();
         }
     }
 
@@ -270,8 +302,20 @@ internal abstract class WorkerBase : IWorker
     /// <returns>The awaitable state change task.</returns>
     private Task<WorkerState> RunWaitForWantedState() => Task.Run(() =>
     {
-        while (!WantedStateCompleted.Wait(Constants.DefaultTimingPeriod))
-            Interrupt();
+        try
+        {
+            while (!WantedStateCompleted.Wait(Constants.DefaultTimingPeriod))
+            {
+                if (IsDisposed || IsDisposing)
+                    break;
+
+                Interrupt();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose can release the wait handle while this task is waiting.
+        }
 
         return WorkerState;
     });
