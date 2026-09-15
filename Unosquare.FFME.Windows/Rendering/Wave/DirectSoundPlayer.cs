@@ -350,27 +350,23 @@
 
             // Create double buffering notifications.
             // Use DirectSoundNotify at Position [0, 1/2] and Stop Position (0xFFFFFFFF)
-            var notifier = audioRenderBuffer as DirectSound.IDirectSoundNotify;
-            try
-            {
-                FrameStartEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
-                FrameEndEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
-                PlaybackEndedEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
-                PlaybackWaitHandles = new WaitHandle[] { FrameStartEventWaitHandle, FrameEndEventWaitHandle, PlaybackEndedEventWaitHandle, CancelEvent };
+            var notifier = AudioBackBuffer as DirectSound.IDirectSoundNotify;
+            FrameStartEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+            FrameEndEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+            PlaybackEndedEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
+            PlaybackWaitHandles = new WaitHandle[] { FrameStartEventWaitHandle, FrameEndEventWaitHandle, PlaybackEndedEventWaitHandle, CancelEvent };
 
-                var notificationEvents = new[]
-                {
-                    CreatePositionNotification(FrameStartEventWaitHandle, 0),
-                    CreatePositionNotification(FrameEndEventWaitHandle, (uint)SamplesFrameSize),
-                    CreatePositionNotification(PlaybackEndedEventWaitHandle, 0xFFFFFFFF)
-                };
-
-                notifier?.SetNotificationPositions((uint)notificationEvents.Length, notificationEvents);
-            }
-            finally
+            var notificationEvents = new[]
             {
-                ReleaseComObject(notifier);
-            }
+                CreatePositionNotification(FrameStartEventWaitHandle, 0),
+                CreatePositionNotification(FrameEndEventWaitHandle, (uint)SamplesFrameSize),
+                CreatePositionNotification(PlaybackEndedEventWaitHandle, 0xFFFFFFFF)
+            };
+
+            // IDirectSoundNotify is another interface view of AudioBackBuffer. Do not
+            // release it separately, because FinalReleaseComObject would invalidate
+            // the AudioBackBuffer RCW that is used by Start and FeedBackBuffer.
+            notifier?.SetNotificationPositions((uint)notificationEvents.Length, notificationEvents);
         }
 
         /// <summary>
