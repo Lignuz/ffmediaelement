@@ -4,6 +4,7 @@ namespace Unosquare.FFME.Engine
     using Common;
     using Container;
     using Diagnostics;
+    using Platform;
     using Primitives;
     using System;
     using System.Diagnostics;
@@ -18,6 +19,8 @@ namespace Unosquare.FFME.Engine
     /// <seealso cref="IMediaWorker" />
     internal sealed class BlockRenderingWorker : WorkerBase, IMediaWorker, ILoggingSource
     {
+        private static readonly TimeSpan MinimumSyncBufferLag = TimeSpan.FromMilliseconds(100);
+
         private readonly AtomicBoolean HasInitialized = new(false);
         private readonly Action<MediaType[]> SerialRenderBlocks;
         private readonly Action<MediaType[]> ParallelRenderBlocks;
@@ -451,6 +454,14 @@ namespace Unosquare.FFME.Engine
                 return;
             }
 
+            if (main == MediaType.Audio && IsAudioOutputBehindPlayback())
+            {
+                MediaCore.SignalSyncBufferingEntered();
+                return;
+            }
+
+            var playbackPosition = MediaCore.PlaybackPosition;
+
             foreach (var t in all)
             {
                 if (t == MediaType.Subtitle || t == main)
@@ -460,9 +471,9 @@ namespace Unosquare.FFME.Engine
                 if (Container.Components[t].IsStillPictures)
                     continue;
 
-                // If we have data on the t component beyond the start time of the main
-                // we don't need to enter sync-buffering.
-                if (MediaCore.Blocks[t].RangeEndTime >= MediaCore.Blocks[main].RangeStartTime)
+                // If a secondary component has fallen materially behind the current
+                // playback position, pause the master clock until it catches up.
+                if (MediaCore.Blocks[t].RangeEndTime >= playbackPosition - MinimumSyncBufferLag)
                     continue;
 
                 // If we are not in range of the non-main component we need to
@@ -470,6 +481,24 @@ namespace Unosquare.FFME.Engine
                 MediaCore.SignalSyncBufferingEntered();
                 return;
             }
+        }
+
+        /// <summary>
+        /// Determines whether the audio output buffer has fallen behind the master clock.
+        /// </summary>
+        private bool IsAudioOutputBehindPlayback()
+        {
+            if (MediaCore.Renderers[MediaType.Audio] is not IAudioClockSource audioSource ||
+                !audioSource.TryGetPlaybackPosition(out var audioPosition))
+            {
+                return false;
+            }
+
+            var toleranceMilliseconds = Math.Max(
+                MinimumSyncBufferLag.TotalMilliseconds,
+                audioSource.PlaybackLatencyMilliseconds * 2d);
+            var tolerance = TimeSpan.FromMilliseconds(toleranceMilliseconds);
+            return audioPosition < MediaCore.PlaybackPosition - tolerance;
         }
 
         /// <summary>
@@ -494,6 +523,9 @@ namespace Unosquare.FFME.Engine
                 State.HasMediaEnded ||
                 Commands.HasPendingCommands ||
                 HasDisconnectedClocks;
+
+            if (canExitSyncBuffering && main == MediaType.Audio && IsAudioOutputBehindPlayback())
+                canExitSyncBuffering = false;
 
             try
             {
@@ -572,7 +604,13 @@ namespace Unosquare.FFME.Engine
         private bool RenderBlock(MediaType t)
         {
             var result = 0;
-            var playbackClock = MediaCore.Timing.GetPosition(t);
+
+            // Keep video selection tied to the audio master clock. Looking up the
+            // video block at the audio position drops frames that have fallen behind
+            // without modifying the audio samples.
+            var playbackClock = t == MediaType.Video && MediaCore.Timing.ReferenceType == MediaType.Audio
+                ? MediaCore.PlaybackPosition
+                : MediaCore.Timing.GetPosition(t);
 
             try
             {
@@ -584,6 +622,17 @@ namespace Unosquare.FFME.Engine
                 var currentBlock = t == MediaType.Subtitle && MediaCore.PreloadedSubtitles != null
                     ? MediaCore.PreloadedSubtitles[playbackClock.Ticks]
                     : MediaCore.Blocks[t][playbackClock.Ticks];
+
+                if (t == MediaType.Video &&
+                    MediaCore.Timing.ReferenceType == MediaType.Audio &&
+                    currentBlock != null &&
+                    playbackClock.Ticks - currentBlock.EndTime.Ticks > MinimumSyncBufferLag.Ticks)
+                {
+                    // Never present a materially stale frame while audio is the
+                    // master clock. The sync-buffering check will pause the clock
+                    // when the decoder has not produced newer video yet.
+                    return result > 0;
+                }
 
                 // Send the block to the corresponding renderer
                 // this will handle fringe and skip cases

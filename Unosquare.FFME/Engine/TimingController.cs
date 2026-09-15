@@ -189,9 +189,22 @@
                         ? MediaType.Audio
                         : components.SeekableMediaType;
 
-                    var discreteType = components.SeekableMediaType;
+                    // For normal audio/video playback, use the audio clock as the
+                    // playback reference. Video rendering will naturally select
+                    // the frame matching the audio position and skip late frames.
+                    // Keep the seekable component as the reference for still-image
+                    // attachments and media without both audio and video streams.
+                    var discreteType = components.HasAudio && components.HasVideo && !components.Video.IsStillPictures
+                        ? MediaType.Audio
+                        : components.SeekableMediaType;
                     HasDisconnectedClocks = options.IsTimeSyncDisabled && Clocks[MediaType.Audio] != Clocks[MediaType.Video];
                     ReferenceType = HasDisconnectedClocks ? continuousType : discreteType;
+
+                    MediaCore.LogInfo(Aspects.Timing,
+                        $"AVSYNC INIT | reference={ReferenceType} | disconnected={HasDisconnectedClocks} | " +
+                        $"audioStart={GetComponentStartOffset(MediaType.Audio).TotalMilliseconds:0.0} ms | " +
+                        $"videoStart={GetComponentStartOffset(MediaType.Video).TotalMilliseconds:0.0} ms | " +
+                        $"streamDelta={(GetComponentStartOffset(MediaType.Audio).Ticks - GetComponentStartOffset(MediaType.Video).Ticks) / (double)TimeSpan.TicksPerMillisecond:0.0} ms");
 
                     // The default data is what the clock reference contains
                     Clocks[MediaType.None] = Clocks[ReferenceType];

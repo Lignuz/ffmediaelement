@@ -19,7 +19,7 @@
     /// <seealso cref="IMediaRenderer" />
     /// <seealso cref="IWaveProvider" />
     /// <seealso cref="IDisposable" />
-    internal sealed class AudioRenderer : IDisposable, IMediaRenderer, IWaveProvider, ILoggingSource
+    internal sealed class AudioRenderer : IDisposable, IMediaRenderer, IAudioClockSource, IWaveProvider, ILoggingSource
     {
         #region Private Members
 
@@ -34,6 +34,8 @@
         private CircularBuffer AudioBuffer;
         private bool IsDisposed;
         private bool m_HasFiredAudioDeviceStopped;
+        private long m_AudioIssueCount;
+        private long m_LastAudioIssueLogTimestamp;
 
         private byte[] ReadBuffer;
         private int SampleBlockSize;
@@ -124,6 +126,16 @@
             }
         }
 
+        /// <inheritdoc />
+        public int PlaybackLatencyMilliseconds
+        {
+            get
+            {
+                lock (SyncLock)
+                    return AudioDevice?.DesiredLatency ?? 0;
+            }
+        }
+
         /// <summary>
         /// Gets or sets a value indicating whether this instance has fired the audio device stopped event.
         /// </summary>
@@ -136,6 +148,23 @@
         #endregion
 
         #region Public API
+
+        /// <inheritdoc />
+        public bool TryGetPlaybackPosition(out TimeSpan position)
+        {
+            lock (SyncLock)
+            {
+                if (AudioBuffer == null || AudioDevice?.IsRunning != true ||
+                    m_HasFiredAudioDeviceStopped || IsClosing.Value)
+                {
+                    position = default;
+                    return false;
+                }
+
+                position = Position;
+                return true;
+            }
+        }
 
         /// <inheritdoc />
         public void Render(MediaBlock mediaBlock, TimeSpan clockPosition)
@@ -306,6 +335,7 @@
 
             if (lockTaken == false)
             {
+                ReportAudioIssue("Audio read lock timeout");
                 Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                 return requestedBytes;
             }
@@ -321,8 +351,15 @@
                 var speedRatio = MediaCore.State.SpeedRatio;
 
                 // Render silence if we don't need to output samples
-                if (MediaCore.State.IsPlaying == false || speedRatio <= 0d || MediaCore.State.HasAudio == false || AudioBuffer.ReadableCount <= 0)
+                if (MediaCore.State.IsPlaying == false || speedRatio <= 0d || MediaCore.State.HasAudio == false)
                 {
+                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                    return requestedBytes;
+                }
+
+                if (AudioBuffer == null || AudioBuffer.ReadableCount <= 0)
+                {
+                    ReportAudioIssue("Audio buffer underrun");
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                     return requestedBytes;
                 }
@@ -356,11 +393,15 @@
                 {
                     // Preserve any samples available during a short underrun and fill only
                     // the missing tail with silence instead of dropping the whole request.
-                    var bytesToRead = Math.Min(requestedBytes, AudioBuffer.ReadableCount);
+                    var readableBytes = AudioBuffer.ReadableCount;
+                    var bytesToRead = Math.Min(requestedBytes, readableBytes);
                     bytesToRead -= bytesToRead % SampleBlockSize;
                     Array.Clear(ReadBuffer, 0, requestedBytes);
                     if (bytesToRead > 0)
                         AudioBuffer.Read(bytesToRead, ReadBuffer, 0);
+
+                    if (bytesToRead < requestedBytes)
+                        ReportAudioIssue($"Audio buffer short read: requested={requestedBytes}, available={readableBytes}");
                 }
 
                 ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
@@ -403,6 +444,23 @@
         #endregion
 
         #region Private Methods
+
+        private void ReportAudioIssue(string reason)
+        {
+            var issueCount = Interlocked.Increment(ref m_AudioIssueCount);
+            var now = DateTime.UtcNow.Ticks;
+            var last = Interlocked.Read(ref m_LastAudioIssueLogTimestamp);
+            if (last != 0 && now - last < TimeSpan.TicksPerSecond)
+                return;
+
+            if (Interlocked.CompareExchange(ref m_LastAudioIssueLogTimestamp, now, last) != last)
+                return;
+
+            var readableBytes = AudioBuffer?.ReadableCount ?? -1;
+            this.LogWarning(
+                Aspects.AudioRenderer,
+                $"{reason} | count={issueCount} | readable={readableBytes} | state={MediaCore.State.MediaState}");
+        }
 
         /// <summary>
         /// Called when [application exit].
@@ -576,6 +634,12 @@
                 // we don't want to perform AV sync if the latency is huge
                 // or if we have simply disabled it
                 if (MediaElement.RendererOptions.AudioDisableSync)
+                    return true;
+
+                // With audio as the playback reference, changing samples here to
+                // chase the video clock can produce audible clicks. Video is
+                // adjusted to this clock by BlockRenderingWorker instead.
+                if (MediaCore.Timing.ReferenceType == MediaType.Audio)
                     return true;
 
                 // Don't perform sycs back and forth so often.

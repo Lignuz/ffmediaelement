@@ -43,6 +43,7 @@
         private EventWaitHandle FrameEndEventWaitHandle;
         private EventWaitHandle PlaybackEndedEventWaitHandle;
         private WaitHandle[] PlaybackWaitHandles;
+        private DateTime LastWaitTimeoutLog;
 
         #endregion
 
@@ -156,7 +157,16 @@
 
             // Not ready yet
             if (handleIndex == TimeoutHandle)
+            {
+                if ((DateTime.UtcNow - LastWaitTimeoutLog).TotalSeconds >= 1)
+                {
+                    LastWaitTimeoutLog = DateTime.UtcNow;
+                    this.LogWarning(Aspects.AudioRenderer,
+                        $"{nameof(DirectSoundPlayer)} playback wait timed out. Desired Latency: {DesiredLatency}ms");
+                }
+
                 return;
+            }
 
             // Handle cancel events
             if (handleIndex == CancelHandle || handleIndex == PlaybackEndHandle)

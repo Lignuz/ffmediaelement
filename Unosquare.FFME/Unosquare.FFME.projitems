@@ -68,6 +68,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Common\IMediaEngineState.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Common\IMediaInputStream.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Platform\IMediaRenderer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Platform\IAudioClockSource.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Container\MediaBlock.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Common\MediaContainerException.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Engine\MediaEngineState.cs" />
