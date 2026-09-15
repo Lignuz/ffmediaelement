@@ -282,6 +282,10 @@
                 // Signal the initial state
                 var source = inputStream == null ? streamUri : inputStream.StreamUri;
                 MediaCore.Timing.Reset();
+
+                // This flag belongs to the media engine instance, so reset it
+                // when reusing the engine for a new media source.
+                MediaCore.HasDecodingEnded = false;
                 State.ResetAll();
                 State.UpdateSource(source);
 
