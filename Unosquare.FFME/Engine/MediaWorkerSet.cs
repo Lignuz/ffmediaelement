@@ -194,13 +194,14 @@
             lock (SyncLock)
             {
                 if (IsDisposed) return;
-                IsDisposed = true;
 
                 if (alsoManaged == false) return;
 
                 Pause(true, true, true, true);
                 foreach (var worker in Workers)
                     worker.Dispose();
+
+                IsDisposed = true;
             }
         }
     }

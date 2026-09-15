@@ -410,6 +410,7 @@
         {
             private readonly object SyncLock = new();
             private bool IsDisposed;
+            private int ActiveWaiters;
 
             /// <summary>
             /// Initializes a new instance of the <see cref="SeekOperation"/> class.
@@ -445,9 +446,22 @@
                 lock (SyncLock)
                 {
                     if (IsDisposed) return;
+                    ActiveWaiters++;
                 }
 
-                SeekCompleted.Wait();
+                try
+                {
+                    SeekCompleted.Wait();
+                }
+                finally
+                {
+                    lock (SyncLock)
+                    {
+                        ActiveWaiters--;
+                        if (IsDisposed && ActiveWaiters == 0)
+                            SeekCompleted.Dispose();
+                    }
+                }
             }
 
             /// <inheritdoc />
@@ -459,16 +473,18 @@
             /// <param name="alsoManaged"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
             private void Dispose(bool alsoManaged)
             {
+                var disposeEvent = false;
                 lock (SyncLock)
                 {
                     if (IsDisposed) return;
+                    IsDisposed = true;
                     SeekCompleted.Set();
 
-                    if (alsoManaged)
-                        SeekCompleted.Dispose();
-
-                    IsDisposed = true;
+                    disposeEvent = alsoManaged && ActiveWaiters == 0;
                 }
+
+                if (disposeEvent)
+                    SeekCompleted.Dispose();
             }
         }
 

@@ -160,14 +160,36 @@
             // Force captions reset in the background so it's the last thing processed.
             ClearCaptions();
 
-            // Force image source refresh in the background so it's the last thing processed.
-            VideoDispatcher?.InvokeAsync(() =>
+            // Complete the old renderer's image reset before its resources are released.
+            // An enqueued reset could otherwise run after the next media has presented
+            // its first frame and clear the new image.
+            var dispatcher = VideoDispatcher;
+            if (dispatcher == null)
+                return;
+
+            try
             {
-                var videoView = MediaElement.VideoView;
-                if (videoView != null)
-                    videoView.Source = null;
-            },
-            DispatcherPriority.Background);
+                if (dispatcher.CheckAccess())
+                {
+                    var videoView = MediaElement.VideoView;
+                    if (videoView != null)
+                        videoView.Source = null;
+                }
+                else
+                {
+                    dispatcher.Invoke(() =>
+                    {
+                        var videoView = MediaElement.VideoView;
+                        if (videoView != null)
+                            videoView.Source = null;
+                    },
+                    DispatcherPriority.Background);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // The dispatcher can be shutting down while the window is closing.
+            }
         }
 
         /// <summary>
@@ -204,9 +226,13 @@
             MediaElement?.CaptionsView?.SendPackets(block, MediaCore);
 
             if (!IsRenderTime)
+            {
+                // No frame will reach FinishRenderingCycle when the limiter skips it.
+                IsRenderingInProgress = false;
                 return null;
-            else
-                RenderStopwatch.Restart();
+            }
+
+            RenderStopwatch.Restart();
 
             // Return block for rendering
             return block;

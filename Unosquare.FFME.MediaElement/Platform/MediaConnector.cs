@@ -70,7 +70,9 @@
         {
             if (Parent == null || sender == null) return;
 
-            Parent.GuiContext.EnqueueInvoke(async () =>
+            // Complete the GUI callback before the open command is allowed to finish.
+            // EnqueueInvoke with an async lambda becomes async void and can overlap a subsequent close/open.
+            Parent.GuiContext.InvokeAsync(() =>
             {
                 // Set initial controller properties
                 // Has to be on the GUI thread as we are reading dependency properties
@@ -85,23 +87,16 @@
 
                 try
                 {
-                    // Start playback if we don't support pausing
-                    if (sender.State.CanPause == false)
-                    {
-                        await sender.Play().ConfigureAwait(true);
-                        return;
-                    }
-
                     if (Parent.LoadedBehavior == MediaPlaybackState.Play)
-                        await sender.Play().ConfigureAwait(true);
+                        sender.Play().GetAwaiter().GetResult();
                     else if (Parent.LoadedBehavior == MediaPlaybackState.Pause)
-                        await sender.Pause().ConfigureAwait(true);
+                        sender.Pause().GetAwaiter().GetResult();
                 }
                 finally
                 {
                     Parent.PostMediaReadyEvent();
                 }
-            });
+            }).GetAwaiter().GetResult();
         }
 
         /// <inheritdoc />

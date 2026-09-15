@@ -143,30 +143,39 @@
             // We don't need to render anything while we are seeking. Simply drop the blocks.
             if (MediaCore.State.IsSeeking || HasFiredAudioDeviceStopped) return;
 
-            var lockTaken = false;
-
-            if (IsClosing == false)
-                Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
-
-            if (lockTaken == false) return;
-
+            AudioBlock audioBlock;
+            CircularBuffer audioBuffer;
+            MediaBlockBuffer audioBlocks;
             try
             {
-                if ((AudioDevice?.IsRunning ?? false) == false)
-                {
-                    if (HasFiredAudioDeviceStopped) return;
-                    MediaElement.RaiseAudioDeviceStoppedEvent();
-                    HasFiredAudioDeviceStopped = true;
+                var lockTaken = false;
+                if (IsClosing == false)
+                    Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
 
-                    return;
+                if (lockTaken == false) return;
+
+                try
+                {
+                    if ((AudioDevice?.IsRunning ?? false) == false)
+                    {
+                        if (HasFiredAudioDeviceStopped) return;
+                        MediaElement.RaiseAudioDeviceStoppedEvent();
+                        HasFiredAudioDeviceStopped = true;
+
+                        return;
+                    }
+
+                    audioBuffer = AudioBuffer;
+                    audioBlocks = MediaCore.Blocks[MediaType.Audio];
+                    audioBlock = mediaBlock as AudioBlock;
+                }
+                finally
+                {
+                    Monitor.Exit(SyncLock);
                 }
 
-                if (AudioBuffer == null) return;
-
-                // Capture Media Block Reference
-                if (mediaBlock is AudioBlock == false) return;
-                var audioBlock = (AudioBlock)mediaBlock;
-                var audioBlocks = MediaCore.Blocks[MediaType.Audio];
+                if (audioBuffer == null || audioBlocks == null || audioBlock == null)
+                    return;
 
                 while (audioBlock != null)
                 {
@@ -177,13 +186,22 @@
                     {
                         // Write the block if we have to, avoiding repeated blocks.
                         // TODO: Ideally we want to feed the blocks from the renderer itself
-                        if (AudioBuffer.WriteTag.Ticks < audioBlock.EndTime.Ticks)
+                        var stopFilling = false;
+                        lock (SyncLock)
                         {
-                            AudioBuffer.Write(audioBlock.Buffer, audioBlock.SamplesBufferLength, audioBlock.EndTime, true);
+                            if (IsClosing.Value || !ReferenceEquals(AudioBuffer, audioBuffer))
+                                return;
+
+                            if (audioBuffer.WriteTag.Ticks < audioBlock.EndTime.Ticks)
+                            {
+                                audioBuffer.Write(audioBlock.Buffer, audioBlock.SamplesBufferLength, audioBlock.EndTime, true);
+                            }
+
+                            // Stop adding if we have too much in there.
+                            stopFilling = audioBuffer.CapacityPercent >= 0.5;
                         }
 
-                        // Stop adding if we have too much in there.
-                        if (AudioBuffer.CapacityPercent >= 0.5)
+                        if (stopFilling)
                             break;
 
                         // Retrieve the following block
@@ -194,10 +212,6 @@
             catch (Exception ex)
             {
                 this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} has faulted.", ex);
-            }
-            finally
-            {
-                Monitor.Exit(SyncLock);
             }
         }
 
@@ -284,11 +298,13 @@
         {
             // We sync-lock the reads to avoid null reference exceptions as destroy might have been called
             var lockTaken = false;
+            var shouldRaiseRenderingEvent = false;
+            var startPosition = TimeSpan.Zero;
 
             if (IsClosing == false)
                 Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
 
-            if (lockTaken == false || HasFiredAudioDeviceStopped)
+            if (lockTaken == false)
             {
                 Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                 return requestedBytes;
@@ -296,6 +312,12 @@
 
             try
             {
+                if (HasFiredAudioDeviceStopped)
+                {
+                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                    return requestedBytes;
+                }
+
                 var speedRatio = MediaCore.State.SpeedRatio;
 
                 // Render silence if we don't need to output samples
@@ -313,7 +335,7 @@
                 if (!Synchronize(targetBuffer, targetBufferOffset, requestedBytes, speedRatio))
                     return requestedBytes;
 
-                var startPosition = Position;
+                startPosition = Position;
 
                 // Perform DSP
                 if (speedRatio < 1.0)
@@ -332,18 +354,17 @@
                 }
                 else
                 {
-                    if (requestedBytes > AudioBuffer.ReadableCount)
-                    {
-                        Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
-                        return requestedBytes;
-                    }
-
-                    AudioBuffer.Read(requestedBytes, ReadBuffer, 0);
+                    // Preserve any samples available during a short underrun and fill only
+                    // the missing tail with silence instead of dropping the whole request.
+                    var bytesToRead = Math.Min(requestedBytes, AudioBuffer.ReadableCount);
+                    bytesToRead -= bytesToRead % SampleBlockSize;
+                    Array.Clear(ReadBuffer, 0, requestedBytes);
+                    if (bytesToRead > 0)
+                        AudioBuffer.Read(bytesToRead, ReadBuffer, 0);
                 }
 
                 ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
-                MediaElement.RaiseRenderingAudioEvent(
-                    targetBuffer, requestedBytes, startPosition, WaveFormat.ConvertByteSizeToDuration(requestedBytes), RealTimeLatency, ffmpeg.AV_NOPTS_VALUE);
+                shouldRaiseRenderingEvent = true;
             }
             catch (Exception ex)
             {
@@ -353,6 +374,27 @@
             finally
             {
                 Monitor.Exit(SyncLock);
+            }
+
+            // Do not hold the audio buffer lock while user callbacks are invoked.
+            // A slow callback would otherwise delay the decoder from filling the buffer.
+            if (shouldRaiseRenderingEvent)
+            {
+                try
+                {
+                    MediaElement.RaiseRenderingAudioEvent(
+                        targetBuffer,
+                        requestedBytes,
+                        startPosition,
+                        WaveFormat.ConvertByteSizeToDuration(requestedBytes),
+                        RealTimeLatency,
+                        ffmpeg.AV_NOPTS_VALUE);
+                }
+                catch (Exception ex)
+                {
+                    this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} audio callback faulted.", ex);
+                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                }
             }
 
             return requestedBytes;
@@ -414,7 +456,8 @@
             }
 
             // Initialize the Audio Device
-            AudioDevice = MediaElement.RendererOptions.UseLegacyAudioOut ?
+            var useLegacyAudioOut = MediaElement.RendererOptions.UseLegacyAudioOut;
+            AudioDevice = useLegacyAudioOut ?
                 new LegacyAudioPlayer(this, MediaElement.RendererOptions.LegacyAudioDevice?.DeviceId ?? -1) :
                 new DirectSoundPlayer(this, MediaElement.RendererOptions.DirectSoundDevice?.DeviceId ?? DirectSoundPlayer.DefaultPlaybackDeviceId);
 
@@ -422,7 +465,24 @@
             SampleBlockSize = Constants.AudioBytesPerSample * Constants.AudioChannelCount;
             var bufferLength = WaveFormat.ConvertMillisToByteSize(2000); // 2-second buffer
             AudioBuffer = new CircularBuffer(bufferLength);
-            AudioDevice.Start();
+            try
+            {
+                AudioDevice.Start();
+            }
+            catch (Exception ex) when (useLegacyAudioOut == false)
+            {
+                this.LogWarning(
+                    Aspects.AudioRenderer,
+                    $"DirectSound initialization failed. Falling back to legacy audio output. {ex.Message}");
+
+                try { AudioDevice.Dispose(); } catch { /* Preserve the original failure if fallback fails. */ }
+
+                MediaElement.RendererOptions.UseLegacyAudioOut = true;
+                AudioDevice = new LegacyAudioPlayer(
+                    this,
+                    MediaElement.RendererOptions.LegacyAudioDevice?.DeviceId ?? -1);
+                AudioDevice.Start();
+            }
         }
 
         /// <summary>
@@ -542,10 +602,11 @@
                         return true;
                     }
 
-                    // render silence and return
                     operationName = "SKIP ERR";
-                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
-                    return false;
+
+                    // Keep rendering any samples that are already available. Read will
+                    // fill only the missing tail with silence during a short underrun.
+                    return true;
                 }
                 else if (bufferLatencyMs < minAcceptableLeadMs)
                 {
@@ -561,10 +622,11 @@
                         return true;
                     }
 
-                    // render silence and return
                     operationName = "RWND ERR";
-                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
-                    return false;
+
+                    // Keep rendering any samples that are already available. Read will
+                    // fill only the missing tail with silence during a short underrun.
+                    return true;
                 }
             }
             finally

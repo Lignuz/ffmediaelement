@@ -164,17 +164,35 @@ internal abstract class WorkerBase : IWorker
     /// <param name="alsoManaged">Determines if managed resources hsould also be released.</param>
     protected virtual void Dispose(bool alsoManaged)
     {
-        // Do not release worker resources while the current cycle is still using them.
-        StopAsync().GetAwaiter().GetResult();
-        CyclesCompleted.Wait();
-
         lock (SyncLock)
         {
             if (IsDisposed || IsDisposing)
                 return;
 
+            // Prevent a new timer callback from entering while the current cycle is stopping.
             IsDisposing = true;
+            WantedWorkerState = WorkerState.Stopped;
+            WorkerState = WorkerState.Stopped;
             WantedStateCompleted.Set();
+
+            try
+            {
+                TokenSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The token source was already released by a concurrent shutdown path.
+            }
+        }
+
+        // Do not release worker resources while the current cycle is still using them.
+        CyclesCompleted.Wait();
+
+        lock (SyncLock)
+        {
+            if (IsDisposed)
+                return;
+
             try { OnDisposing(); } catch { /* Ignore */ }
             CycleClock.Reset();
             WantedStateCompleted.Dispose();
@@ -238,7 +256,7 @@ internal abstract class WorkerBase : IWorker
     /// <returns>True if a cycle should be executed.</returns>
     protected bool TryBeginCycle()
     {
-        if (WorkerState == WorkerState.Created || WorkerState == WorkerState.Stopped)
+        if (WorkerState == WorkerState.Created || WorkerState == WorkerState.Stopped || IsDisposing || IsDisposed)
             return false;
 
         LastCycleElapsed = CycleClock.Elapsed;
@@ -246,6 +264,9 @@ internal abstract class WorkerBase : IWorker
 
         lock (SyncLock)
         {
+            if (IsDisposing || IsDisposed)
+                return false;
+
             WorkerState = WantedWorkerState;
             WantedStateCompleted.Set();
 
@@ -261,8 +282,14 @@ internal abstract class WorkerBase : IWorker
     /// </summary>
     protected void ExecuteCyle()
     {
-        Interlocked.Increment(ref m_ActiveCycles);
-        CyclesCompleted.Reset();
+        lock (SyncLock)
+        {
+            if (IsDisposing || IsDisposed)
+                return;
+
+            Interlocked.Increment(ref m_ActiveCycles);
+            CyclesCompleted.Reset();
+        }
 
         try
         {

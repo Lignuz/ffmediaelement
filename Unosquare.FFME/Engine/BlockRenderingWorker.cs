@@ -23,6 +23,7 @@ namespace Unosquare.FFME.Engine
         private readonly Action<MediaType[]> ParallelRenderBlocks;
         private readonly Thread QuantumThread;
         private readonly ManualResetEventSlim QuantumWaiter = new(false);
+        private int m_RenderThreadDisposing;
         private DateTime LastSpeedRatioTime;
 
         /// <summary>
@@ -173,7 +174,17 @@ namespace Unosquare.FFME.Engine
         /// <inheritdoc />
         protected override void Dispose(bool alsoManaged)
         {
+            if (Interlocked.Exchange(ref m_RenderThreadDisposing, 1) != 0)
+                return;
+
+            // Wake the dedicated render thread before the base class waits for active cycles.
+            QuantumWaiter.Set();
             base.Dispose(alsoManaged);
+
+            // The thread may still be between cycles; wait before releasing its wait handle.
+            if (QuantumThread.IsAlive && !ReferenceEquals(QuantumThread, Thread.CurrentThread))
+                QuantumThread.Join();
+
             QuantumWaiter.Dispose();
         }
 

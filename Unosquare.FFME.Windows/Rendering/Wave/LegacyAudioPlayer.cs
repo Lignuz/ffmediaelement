@@ -107,33 +107,41 @@
             if (DeviceHandle != IntPtr.Zero || IsDisposed)
                 throw new InvalidOperationException($"{nameof(LegacyAudioPlayer)} was already started");
 
-            var bufferSize = Renderer.WaveFormat.ConvertMillisToByteSize((DesiredLatency + NumberOfBuffers - 1) / NumberOfBuffers);
-
-            // Acquire a device handle
-            DeviceHandle = WaveInterop.OpenAudioDevice(
-                DeviceNumber,
-                Renderer.WaveFormat,
-                DriverCallbackEvent.SafeWaitHandle,
-                IntPtr.Zero,
-                WaveInterop.WaveInOutOpenFlags.CallbackEvent);
-
-            // Create the buffers
-            Buffers = new WaveOutBuffer[NumberOfBuffers];
-            for (var n = 0; n < NumberOfBuffers; n++)
+            try
             {
-                Buffers[n] = new WaveOutBuffer(DeviceHandle, bufferSize, Renderer);
-            }
+                var bufferSize = Renderer.WaveFormat.ConvertMillisToByteSize((DesiredLatency + NumberOfBuffers - 1) / NumberOfBuffers);
 
-            // Start the playback thread
-            DriverCallbackEvent.Set(); // give the thread an initial kick
-            PlaybackState = PlaybackState.Playing;
-            StartAsync();
+                // Acquire a device handle
+                DeviceHandle = WaveInterop.OpenAudioDevice(
+                    DeviceNumber,
+                    Renderer.WaveFormat,
+                    DriverCallbackEvent.SafeWaitHandle,
+                    IntPtr.Zero,
+                    WaveInterop.WaveInOutOpenFlags.CallbackEvent);
+
+                // Create the buffers
+                Buffers = new WaveOutBuffer[NumberOfBuffers];
+                for (var n = 0; n < NumberOfBuffers; n++)
+                {
+                    Buffers[n] = new WaveOutBuffer(DeviceHandle, bufferSize, Renderer);
+                }
+
+                // Start the playback thread
+                DriverCallbackEvent.Set(); // give the thread an initial kick
+                PlaybackState = PlaybackState.Playing;
+                StartAsync();
+            }
+            catch
+            {
+                try { Dispose(); } catch { /* Preserve the original initialization failure. */ }
+                throw;
+            }
         }
 
         /// <inheritdoc />
         public void Clear()
         {
-            if (IsDisposed) return;
+            if (IsDisposed || Buffers == null) return;
             foreach (var buffer in Buffers)
                 buffer.Clear();
         }
@@ -180,7 +188,7 @@
             try { WaveInterop.ResetAudioDevice(DeviceHandle); } catch { /* Ignore */ }
 
             // Dispose of buffers
-            foreach (var buffer in Buffers)
+            foreach (var buffer in Buffers ?? Array.Empty<WaveOutBuffer>())
                 try { buffer.Dispose(); } catch { /* Ignore */ }
 
             // Close the device
