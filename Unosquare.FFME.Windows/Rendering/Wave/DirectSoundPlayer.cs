@@ -14,7 +14,7 @@
     /// Contact author: Alexandre Mutel - alexandre_mutel at yahoo.fr
     /// Modified by: Graham "Gee" Plumb.
     /// </summary>
-    internal sealed class DirectSoundPlayer : IntervalWorkerBase, IWavePlayer, ILoggingSource
+    internal sealed class DirectSoundPlayer : AudioWorkerBase, IWavePlayer, ILoggingSource
     {
         #region Fields
 
