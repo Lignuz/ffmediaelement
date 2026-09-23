@@ -20,6 +20,9 @@ namespace Unosquare.FFME.Engine
     internal sealed class BlockRenderingWorker : WorkerBase, IMediaWorker, ILoggingSource
     {
         private static readonly TimeSpan MinimumSyncBufferLag = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan MaximumSyncBufferDuration = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan SyncBufferRetryDelay = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan AudioRealignLogInterval = TimeSpan.FromSeconds(1);
 
         private readonly AtomicBoolean HasInitialized = new(false);
         private readonly Action<MediaType[]> SerialRenderBlocks;
@@ -28,6 +31,9 @@ namespace Unosquare.FFME.Engine
         private readonly ManualResetEventSlim QuantumWaiter = new(false);
         private int m_RenderThreadDisposing;
         private DateTime LastSpeedRatioTime;
+        private DateTime SyncBufferEnteredTime;
+        private DateTime SyncBufferRetryTime;
+        private DateTime LastAudioRealignLogTime;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BlockRenderingWorker"/> class.
@@ -454,11 +460,16 @@ namespace Unosquare.FFME.Engine
                 return;
             }
 
-            if (main == MediaType.Audio && IsAudioOutputBehindPlayback())
-            {
-                MediaCore.SignalSyncBufferingEntered();
+            // Keep the master clock on the audio output instead of pausing it. While the
+            // clock is paused the audio renderer only outputs silence, so a lagging audio
+            // output could never catch up and playback would stall until the next command.
+            if (main == MediaType.Audio)
+                RealignClockToAudioOutput(main);
+
+            // A previous sync-buffering wait timed out. Give the decoder some time
+            // before pausing the clock for the secondary components again.
+            if (DateTime.UtcNow < SyncBufferRetryTime)
                 return;
-            }
 
             var playbackPosition = MediaCore.PlaybackPosition;
 
@@ -478,27 +489,52 @@ namespace Unosquare.FFME.Engine
 
                 // If we are not in range of the non-main component we need to
                 // enter sync-buffering
+                SyncBufferEnteredTime = DateTime.UtcNow;
                 MediaCore.SignalSyncBufferingEntered();
                 return;
             }
         }
 
         /// <summary>
-        /// Determines whether the audio output buffer has fallen behind the master clock.
+        /// Moves the master clock back to the audio output position when the audio
+        /// output has fallen behind it (e.g. after buffer underruns filled with silence).
         /// </summary>
-        private bool IsAudioOutputBehindPlayback()
+        /// <param name="main">The main renderer component.</param>
+        private void RealignClockToAudioOutput(MediaType main)
         {
             if (MediaCore.Renderers[MediaType.Audio] is not IAudioClockSource audioSource ||
                 !audioSource.TryGetPlaybackPosition(out var audioPosition))
             {
-                return false;
+                return;
             }
 
             var toleranceMilliseconds = Math.Max(
                 MinimumSyncBufferLag.TotalMilliseconds,
                 audioSource.PlaybackLatencyMilliseconds * 2d);
             var tolerance = TimeSpan.FromMilliseconds(toleranceMilliseconds);
-            return audioPosition < MediaCore.PlaybackPosition - tolerance;
+            var playbackPosition = MediaCore.PlaybackPosition;
+            if (audioPosition >= playbackPosition - tolerance)
+                return;
+
+            // Don't move the clock before the available main blocks; the clock alignment
+            // would move it forward again on the next cycle.
+            var blocks = MediaCore.Blocks[main];
+            var targetPosition = blocks.Count > 0 && audioPosition < blocks.RangeStartTime
+                ? blocks.RangeStartTime
+                : audioPosition;
+
+            // Update the clock directly: changing the playback position would invalidate
+            // the renderers and discard the audio samples that are still queued.
+            MediaCore.Timing.Update(targetPosition, MediaType.None);
+
+            var now = DateTime.UtcNow;
+            if (now - LastAudioRealignLogTime < AudioRealignLogInterval)
+                return;
+
+            LastAudioRealignLogTime = now;
+            this.LogWarning(Aspects.Timing,
+                $"AUDIO REALIGN: clock moved from {playbackPosition.Format()} to {targetPosition.Format()} " +
+                $"to follow the audio output (lag {(playbackPosition - targetPosition).TotalMilliseconds:0} ms).");
         }
 
         /// <summary>
@@ -515,6 +551,7 @@ namespace Unosquare.FFME.Engine
                 return;
 
             // Detect if an exit from Sync Buffering is required
+            var hasTimedOut = DateTime.UtcNow - SyncBufferEnteredTime > MaximumSyncBufferDuration;
             var canExitSyncBuffering = MediaCore.Blocks[main].Count > 0;
             var mustExitSyncBuffering =
                 ct.IsCancellationRequested ||
@@ -522,15 +559,22 @@ namespace Unosquare.FFME.Engine
                 Container.IsAtEndOfStream ||
                 State.HasMediaEnded ||
                 Commands.HasPendingCommands ||
-                HasDisconnectedClocks;
-
-            if (canExitSyncBuffering && main == MediaType.Audio && IsAudioOutputBehindPlayback())
-                canExitSyncBuffering = false;
+                HasDisconnectedClocks ||
+                hasTimedOut;
 
             try
             {
                 if (mustExitSyncBuffering)
                 {
+                    if (hasTimedOut)
+                    {
+                        // Never keep the clock paused indefinitely. Resume playback and
+                        // wait a while before sync-buffering on the secondary components again.
+                        SyncBufferRetryTime = DateTime.UtcNow + SyncBufferRetryDelay;
+                        this.LogWarning(Aspects.RenderingWorker,
+                            $"SYNC-BUFFER: timed out after {MaximumSyncBufferDuration.TotalSeconds:0} s. Resuming playback.");
+                    }
+
                     this.LogDebug(Aspects.ReadingWorker, $"SYNC-BUFFER: 'must exit' condition met.");
                     return;
                 }
