@@ -14,7 +14,7 @@
     internal sealed class PacketReadingWorker : IntervalWorkerBase, IMediaWorker, ILoggingSource
     {
         public PacketReadingWorker(MediaEngine mediaCore)
-            : base(nameof(PacketReadingWorker))
+            : base(nameof(PacketReadingWorker), ThreadPriority.Highest)
         {
             MediaCore = mediaCore;
             Container = mediaCore.Container;

@@ -45,7 +45,9 @@ namespace Unosquare.FFME
         /// </summary>
         private readonly bool AllowContentChange;
 
-        private readonly ConcurrentBag<string> PropertyUpdates = new();
+        // A queue instead of a bag: ConcurrentBag.IsEmpty locks the local lists of all threads,
+        // so a preempted UI thread checking it could block the engine threads adding updates.
+        private readonly ConcurrentQueue<string> PropertyUpdates = new();
         private readonly AtomicBoolean m_IsStateUpdating = new(false);
         private readonly DispatcherTimer UpdatesTimer;
 
@@ -90,7 +92,7 @@ namespace Unosquare.FFME
 
                     // Setup the media engine and property updates timer
                     MediaCore = new MediaEngine(this, new MediaConnector(this));
-                    MediaCore.State.PropertyChanged += (s, e) => PropertyUpdates.Add(e.PropertyName);
+                    MediaCore.State.PropertyChanged += (s, e) => PropertyUpdates.Enqueue(e.PropertyName);
 
                     // When the media element is removed from the visual tree
                     // we want to close the current media to prevent memory leaks
@@ -356,7 +358,7 @@ namespace Unosquare.FFME
                     return;
 
                 IsStateUpdating = true;
-                while (PropertyUpdates.TryTake(out var p))
+                while (PropertyUpdates.TryDequeue(out var p))
                 {
                     if (p == nameof(Position) || p == nameof(NaturalDuration))
                     {

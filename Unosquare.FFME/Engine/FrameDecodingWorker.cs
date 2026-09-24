@@ -31,7 +31,7 @@
         /// </summary>
         /// <param name="mediaCore">The media core.</param>
         public FrameDecodingWorker(MediaEngine mediaCore)
-            : base(nameof(FrameDecodingWorker))
+            : base(nameof(FrameDecodingWorker), ThreadPriority.Highest)
         {
             MediaCore = mediaCore;
             Container = mediaCore.Container;

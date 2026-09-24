@@ -99,6 +99,23 @@
         /// <param name="auxiliaryProperties">The auxiliary properties.</param>
         private void NotifyPropertyChanged(string mainProperty, string[] auxiliaryProperties)
         {
+            // Raise immediate notifications directly. Queuing them takes the dictionary locks
+            // (enumerating its keys takes all of them), so a preempted low priority thread
+            // could block the high priority engine threads that update the state.
+            if (!UseDeferredNotifications)
+            {
+                if (string.IsNullOrWhiteSpace(mainProperty) == false)
+                    OnPropertyChanged(mainProperty);
+
+                foreach (var property in auxiliaryProperties ?? Array.Empty<string>())
+                {
+                    if (string.IsNullOrWhiteSpace(property) == false)
+                        OnPropertyChanged(property);
+                }
+
+                return;
+            }
+
             // Queue property notification
             if (string.IsNullOrWhiteSpace(mainProperty) == false)
                 QueuedNotifications[mainProperty] = true;

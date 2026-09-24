@@ -22,7 +22,8 @@ namespace Unosquare.FFME.Engine
         private static readonly TimeSpan MinimumSyncBufferLag = TimeSpan.FromMilliseconds(100);
         private static readonly TimeSpan MaximumSyncBufferDuration = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan SyncBufferRetryDelay = TimeSpan.FromSeconds(3);
-        private static readonly TimeSpan AudioRealignLogInterval = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan WarningLogInterval = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan DecodeStarvationGracePeriod = TimeSpan.FromSeconds(1);
 
         private readonly AtomicBoolean HasInitialized = new(false);
         private readonly Action<MediaType[]> SerialRenderBlocks;
@@ -34,6 +35,8 @@ namespace Unosquare.FFME.Engine
         private DateTime SyncBufferEnteredTime;
         private DateTime SyncBufferRetryTime;
         private DateTime LastAudioRealignLogTime;
+        private DateTime LastDecodeStarvationLogTime;
+        private DateTime ClockResumedTime;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BlockRenderingWorker"/> class.
@@ -48,7 +51,19 @@ namespace Unosquare.FFME.Engine
             MediaOptions = mediaCore.MediaOptions;
             State = MediaCore.State;
             ParallelRenderBlocks = (all) => Parallel.ForEach(all, (t) => RenderBlock(t));
-            SerialRenderBlocks = (all) => { foreach (var t in all) RenderBlock(t); };
+            SerialRenderBlocks = (all) =>
+            {
+                // Feed the audio device first so a video frame waiting for the UI thread
+                // does not hold back the audio samples.
+                if (all.Contains(MediaType.Audio))
+                    RenderBlock(MediaType.Audio);
+
+                foreach (var t in all)
+                {
+                    if (t != MediaType.Audio)
+                        RenderBlock(t);
+                }
+            };
 
             QuantumThread = new Thread(RunQuantumThread)
             {
@@ -338,7 +353,7 @@ namespace Unosquare.FFME.Engine
                 // We have no main blocks in range. All we can do is pause the clock
                 if (MediaCore.Timing.IsRunning)
                 {
-                    this.LogDebug(Aspects.Timing,
+                    ReportDecodeStarvation(
                         $"CLOCK PAUSED: playback clock was paused at {position.Format()} because no decoded {main} content was found");
                 }
 
@@ -356,11 +371,66 @@ namespace Unosquare.FFME.Engine
             else if (position.Ticks > blocks.RangeEndTime.Ticks)
             {
                 // Don't let the RTC move beyond what is available on the main component
+                var wasRunning = MediaCore.Timing.IsRunning;
                 MediaCore.PausePlayback();
                 MediaCore.ChangePlaybackPosition(blocks.RangeEndTime);
-                this.LogTrace(Aspects.Timing,
-                    $"CLOCK AHEAD : playback clock was {position.Format()}. It was updated to {blocks.RangeEndTime.Format()}");
+
+                // Reaching the end of the decoded content while decoding continues means the
+                // decoder could not keep up; at the end of the media it is expected.
+                if (wasRunning && !MediaCore.HasDecodingEnded)
+                {
+                    ReportDecodeStarvation(
+                        $"CLOCK PAUSED: playback clock reached the end of decoded {main} content at {position.Format()}");
+                }
+                else
+                {
+                    this.LogTrace(Aspects.Timing,
+                        $"CLOCK AHEAD : playback clock was {position.Format()}. It was updated to {blocks.RangeEndTime.Format()}");
+                }
             }
+        }
+
+        /// <summary>
+        /// Logs a playback pause caused by missing decoded content as a warning,
+        /// at most once per <see cref="WarningLogInterval"/>, with the pipeline state.
+        /// </summary>
+        /// <param name="message">The message.</param>
+        private void ReportDecodeStarvation(string message)
+        {
+            // Right after opening, seeking or resuming only a few blocks are decoded yet,
+            // so running out of them is expected and not worth a warning.
+            var now = DateTime.UtcNow;
+            if (now - ClockResumedTime < DecodeStarvationGracePeriod ||
+                now - LastDecodeStarvationLogTime < WarningLogInterval)
+                return;
+
+            LastDecodeStarvationLogTime = now;
+            this.LogWarning(Aspects.Timing, message + DescribePipeline());
+        }
+
+        /// <summary>
+        /// Describes the state of the decoding pipeline so the stage that falls behind can be identified.
+        /// </summary>
+        /// <returns>The description, starting with a separator.</returns>
+        private string DescribePipeline()
+        {
+            var now = DateTime.UtcNow;
+            var main = MediaCore.Timing.ReferenceType;
+            var blocks = MediaCore.Blocks[main];
+            var component = Container.Components[main];
+            var workers = MediaCore.Workers;
+
+            static string Describe(IntervalWorkerBase worker, DateTime now) => worker == null
+                ? "n/a"
+                : $"{(now - worker.LastCycleStartTimeUtc).TotalMilliseconds:0} ms ago, took {worker.LastCycleDuration.TotalMilliseconds:0} ms";
+
+            return $" | {main} blocks={blocks?.Count ?? 0}" +
+                (blocks?.Count > 0 ? $" ({blocks.RangeStartTime.Format()} ~ {blocks.RangeEndTime.Format()})" : string.Empty) +
+                $" | packets={component?.BufferCount ?? 0} ({component?.BufferDuration.TotalMilliseconds ?? 0:0} ms)" +
+                $" | decoding ended={MediaCore.HasDecodingEnded}" +
+                $" | reading cycle: {Describe(workers?.Reading, now)}" +
+                $" | decoding cycle: {Describe(workers?.Decoding, now)}" +
+                $" | GC {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}, pause total {GC.GetTotalPauseDuration().TotalMilliseconds:0} ms";
         }
 
         /// <summary>
@@ -528,13 +598,14 @@ namespace Unosquare.FFME.Engine
             MediaCore.Timing.Update(targetPosition, MediaType.None);
 
             var now = DateTime.UtcNow;
-            if (now - LastAudioRealignLogTime < AudioRealignLogInterval)
+            if (now - LastAudioRealignLogTime < WarningLogInterval)
                 return;
 
             LastAudioRealignLogTime = now;
             this.LogWarning(Aspects.Timing,
                 $"AUDIO REALIGN: clock moved from {playbackPosition.Format()} to {targetPosition.Format()} " +
-                $"to follow the audio output (lag {(playbackPosition - targetPosition).TotalMilliseconds:0} ms).");
+                $"to follow the audio output (lag {(playbackPosition - targetPosition).TotalMilliseconds:0} ms)." +
+                DescribePipeline());
         }
 
         /// <summary>
@@ -765,7 +836,12 @@ namespace Unosquare.FFME.Engine
                 // Resume the reference type clock.
                 var t = MediaType.None;
                 if (CanResumeClock(t))
+                {
+                    if (!MediaCore.Timing.IsRunning)
+                        ClockResumedTime = DateTime.UtcNow;
+
                     MediaCore.Timing.Play(t);
+                }
 
                 return;
             }
