@@ -27,6 +27,7 @@
 
         private readonly AtomicBoolean IsClosing = new(false);
         private readonly object SyncLock = new();
+        private readonly AutoResetEvent AudioRefillRequested = new(false);
 
         private IWavePlayer AudioDevice;
         private SoundTouch AudioProcessor;
@@ -36,6 +37,11 @@
         private bool m_HasFiredAudioDeviceStopped;
         private long m_AudioIssueCount;
         private long m_LastAudioIssueLogTimestamp;
+        private long m_SeekGeneration;
+        private int m_LastReadableBytes;
+        private int m_RefillStopping;
+        private int m_RefillEventDisposed;
+        private Thread AudioRefillThread;
 
         private byte[] ReadBuffer;
         private int SampleBlockSize;
@@ -136,6 +142,13 @@
             }
         }
 
+        internal long SeekGeneration => Interlocked.Read(ref m_SeekGeneration);
+
+        internal int BufferedAudioMilliseconds =>
+            Math.Max(0, Volatile.Read(ref m_LastReadableBytes)) * 1000 / WaveFormat.AverageBytesPerSecond;
+
+        internal int DecodedAudioBlockCount => MediaCore.Blocks[MediaType.Audio].ApproximateCount;
+
         /// <summary>
         /// Gets or sets a value indicating whether this instance has fired the audio device stopped event.
         /// </summary>
@@ -169,79 +182,7 @@
         /// <inheritdoc />
         public void Render(MediaBlock mediaBlock, TimeSpan clockPosition)
         {
-            // We don't need to render anything while we are seeking. Simply drop the blocks.
-            if (MediaCore.State.IsSeeking || HasFiredAudioDeviceStopped) return;
-
-            AudioBlock audioBlock;
-            CircularBuffer audioBuffer;
-            MediaBlockBuffer audioBlocks;
-            try
-            {
-                var lockTaken = false;
-                if (IsClosing == false)
-                    Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
-
-                if (lockTaken == false) return;
-
-                try
-                {
-                    if ((AudioDevice?.IsRunning ?? false) == false)
-                    {
-                        if (HasFiredAudioDeviceStopped) return;
-                        MediaElement.RaiseAudioDeviceStoppedEvent();
-                        HasFiredAudioDeviceStopped = true;
-
-                        return;
-                    }
-
-                    audioBuffer = AudioBuffer;
-                    audioBlocks = MediaCore.Blocks[MediaType.Audio];
-                    audioBlock = mediaBlock as AudioBlock;
-                }
-                finally
-                {
-                    Monitor.Exit(SyncLock);
-                }
-
-                if (audioBuffer == null || audioBlocks == null || audioBlock == null)
-                    return;
-
-                while (audioBlock != null)
-                {
-                    if (audioBlock.TryAcquireReaderLock(out var readLock) == false)
-                        return;
-
-                    using (readLock)
-                    {
-                        // Write the block if we have to, avoiding repeated blocks.
-                        // TODO: Ideally we want to feed the blocks from the renderer itself
-                        var stopFilling = false;
-                        lock (SyncLock)
-                        {
-                            if (IsClosing.Value || !ReferenceEquals(AudioBuffer, audioBuffer))
-                                return;
-
-                            if (audioBuffer.WriteTag.Ticks < audioBlock.EndTime.Ticks)
-                            {
-                                audioBuffer.Write(audioBlock.Buffer, audioBlock.SamplesBufferLength, audioBlock.EndTime, true);
-                            }
-
-                            // Stop adding if we have too much in there.
-                            stopFilling = audioBuffer.CapacityPercent >= 0.5;
-                        }
-
-                        if (stopFilling)
-                            break;
-
-                        // Retrieve the following block
-                        audioBlock = audioBlocks.Next(audioBlock) as AudioBlock;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} has faulted.", ex);
-            }
+            RenderCore(mediaBlock, clockPosition, SeekGeneration);
         }
 
         /// <inheritdoc />
@@ -253,7 +194,7 @@
         /// <inheritdoc />
         public void OnPlay()
         {
-            // placeholder
+            RequestRefillIfLow();
         }
 
         /// <inheritdoc />
@@ -277,25 +218,26 @@
             if (Application.Current is Application app)
                 app.Dispatcher?.BeginInvoke(new Action(() => { app.Exit -= OnApplicationExit; }));
 
-            // Yes, seek and destroy... coincidentally.
-            lock (SyncLock)
-            {
-                OnSeek();
-                Destroy();
-            }
+            Interlocked.Increment(ref m_SeekGeneration);
+            Destroy();
+            DisposeRefillEvent();
         }
 
         /// <inheritdoc />
         public void OnSeek()
         {
+            Interlocked.Increment(ref m_SeekGeneration);
+            DirectSoundPlayer directSound;
             lock (SyncLock)
             {
                 AudioBuffer?.Clear();
-
-                // AudioDevice?.Clear(); // TODO: This causes crashes
-                if (ReadBuffer != null)
-                    Array.Clear(ReadBuffer, 0, ReadBuffer.Length);
+                Volatile.Write(ref m_LastReadableBytes, 0);
+                directSound = AudioDevice as DirectSoundPlayer;
             }
+
+            // Device COM operations run on the output worker, outside the PCM lock.
+            directSound?.Clear();
+            RequestRefillIfLow();
         }
 
         /// <inheritdoc />
@@ -314,8 +256,11 @@
                 if (IsDisposed) return;
 
                 IsDisposed = true;
-                Destroy();
             }
+
+            Interlocked.Increment(ref m_SeekGeneration);
+            Destroy();
+            DisposeRefillEvent();
         }
 
         #endregion
@@ -330,19 +275,25 @@
             var shouldRaiseRenderingEvent = false;
             var startPosition = TimeSpan.Zero;
 
-            if (IsClosing == false)
-                Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
+            if (IsClosing.Value)
+            {
+                Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
+                return requestedBytes;
+            }
+
+            Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
 
             if (lockTaken == false)
             {
-                ReportAudioIssue("Audio read lock timeout");
+                if (!IsClosing.Value)
+                    ReportAudioIssue("Audio read lock timeout");
                 Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                 return requestedBytes;
             }
 
             try
             {
-                if (HasFiredAudioDeviceStopped)
+                if (IsClosing.Value || HasFiredAudioDeviceStopped)
                 {
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                     return requestedBytes;
@@ -359,14 +310,18 @@
 
                 if (AudioBuffer == null || AudioBuffer.ReadableCount <= 0)
                 {
+                    Volatile.Write(ref m_LastReadableBytes, 0);
                     ReportAudioIssue("Audio buffer underrun");
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                     return requestedBytes;
                 }
 
-                // Ensure a pre-allocated ReadBuffer
-                if (ReadBuffer == null || ReadBuffer.Length < Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio))
-                    ReadBuffer = new byte[Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio)];
+                // Slowing down uses a second region after the output samples. Faster
+                // playback needs only the samples consumed at the selected ratio.
+                var requiredBytes = Convert.ToInt32(requestedBytes * Math.Max(2d, speedRatio)) + SampleBlockSize;
+                if (ReadBuffer == null || ReadBuffer.Length < requiredBytes)
+                    ReadBuffer = new byte[requiredBytes];
+                Array.Clear(ReadBuffer, 0, requestedBytes);
 
                 // First part of DSP: Perform AV Synchronization if needed
                 if (!Synchronize(targetBuffer, targetBufferOffset, requestedBytes, speedRatio))
@@ -396,7 +351,6 @@
                     var readableBytes = AudioBuffer.ReadableCount;
                     var bytesToRead = Math.Min(requestedBytes, readableBytes);
                     bytesToRead -= bytesToRead % SampleBlockSize;
-                    Array.Clear(ReadBuffer, 0, requestedBytes);
                     if (bytesToRead > 0)
                         AudioBuffer.Read(bytesToRead, ReadBuffer, 0);
 
@@ -405,6 +359,7 @@
                 }
 
                 ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
+                Volatile.Write(ref m_LastReadableBytes, AudioBuffer.ReadableCount);
                 shouldRaiseRenderingEvent = true;
             }
             catch (Exception ex)
@@ -441,9 +396,155 @@
             return requestedBytes;
         }
 
+        internal void RequestRefillIfLow()
+        {
+            if (!IsClosing.Value && BufferedAudioMilliseconds < 500 && Volatile.Read(ref m_RefillStopping) == 0)
+                AudioRefillRequested.Set();
+        }
+
         #endregion
 
         #region Private Methods
+
+        private void RenderCore(MediaBlock mediaBlock, TimeSpan clockPosition, long expectedGeneration)
+        {
+            // We don't need to render anything while we are seeking. Simply drop the blocks.
+            if (MediaCore.State.IsSeeking || HasFiredAudioDeviceStopped || expectedGeneration != SeekGeneration) return;
+
+            AudioBlock audioBlock;
+            CircularBuffer audioBuffer;
+            MediaBlockBuffer audioBlocks;
+            var shouldRaiseAudioDeviceStopped = false;
+            try
+            {
+                var lockTaken = false;
+                if (IsClosing == false)
+                    Monitor.TryEnter(SyncLock, SyncLockTimeout, ref lockTaken);
+
+                if (lockTaken == false) return;
+
+                try
+                {
+                    if (IsClosing.Value || expectedGeneration != SeekGeneration)
+                        return;
+
+                    if ((AudioDevice?.IsRunning ?? false) == false)
+                    {
+                        if (HasFiredAudioDeviceStopped) return;
+                        HasFiredAudioDeviceStopped = true;
+                        shouldRaiseAudioDeviceStopped = true;
+                        audioBuffer = null;
+                        audioBlocks = null;
+                        audioBlock = null;
+                    }
+                    else
+                    {
+                        audioBuffer = AudioBuffer;
+                        audioBlocks = MediaCore.Blocks[MediaType.Audio];
+                        audioBlock = mediaBlock as AudioBlock;
+                    }
+                }
+                finally
+                {
+                    Monitor.Exit(SyncLock);
+                }
+
+                if (shouldRaiseAudioDeviceStopped)
+                {
+                    MediaElement.RaiseAudioDeviceStoppedEvent();
+                    return;
+                }
+
+                if (audioBuffer == null || audioBlocks == null || audioBlock == null)
+                    return;
+
+                while (audioBlock != null)
+                {
+                    if (audioBlock.TryAcquireReaderLock(out var readLock) == false)
+                        return;
+
+                    using (readLock)
+                    {
+                        // Write the block if we have to, avoiding repeated blocks.
+                        // TODO: Ideally we want to feed the blocks from the renderer itself
+                        var stopFilling = false;
+                        lock (SyncLock)
+                        {
+                            if (IsClosing.Value || expectedGeneration != SeekGeneration || !ReferenceEquals(AudioBuffer, audioBuffer))
+                                return;
+
+                            if (audioBuffer.WriteTag.Ticks < audioBlock.EndTime.Ticks)
+                            {
+                                audioBuffer.Write(audioBlock.Buffer, audioBlock.SamplesBufferLength, audioBlock.EndTime, true);
+                            }
+
+                            // Stop adding if we have too much in there.
+                            stopFilling = audioBuffer.CapacityPercent >= 0.5;
+                            Volatile.Write(ref m_LastReadableBytes, audioBuffer.ReadableCount);
+                        }
+
+                        if (stopFilling)
+                            break;
+
+                        // Retrieve the following block
+                        audioBlock = audioBlocks.Next(audioBlock) as AudioBlock;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Render)} has faulted.", ex);
+            }
+        }
+
+        private void RunAudioRefill()
+        {
+            try
+            {
+                while (Volatile.Read(ref m_RefillStopping) == 0 && !IsClosing.Value)
+                {
+                    AudioRefillRequested.WaitOne(15);
+                    if (Volatile.Read(ref m_RefillStopping) != 0 || IsClosing.Value ||
+                        MediaCore.State.IsSeeking || MediaCore.State.MediaState != MediaPlaybackState.Play ||
+                        BufferedAudioMilliseconds >= 500)
+                    {
+                        continue;
+                    }
+
+                    var blocks = MediaCore.Blocks[MediaType.Audio];
+                    if (blocks == null || blocks.ApproximateCount <= 0)
+                        continue;
+
+                    var generation = SeekGeneration;
+                    TimeSpan nextPosition;
+                    lock (SyncLock)
+                    {
+                        if (AudioBuffer == null || generation != SeekGeneration)
+                            continue;
+
+                        nextPosition = AudioBuffer.WriteTag;
+                    }
+
+                    if (nextPosition == TimeSpan.MinValue)
+                        nextPosition = MediaCore.Timing.GetPosition(MediaType.Audio);
+
+                    var block = blocks[nextPosition.Ticks];
+                    if (block != null && generation == SeekGeneration)
+                        RenderCore(block, nextPosition, generation);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!IsClosing.Value)
+                    this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(RunAudioRefill)} has faulted.", ex);
+            }
+        }
+
+        private void DisposeRefillEvent()
+        {
+            if (Interlocked.Exchange(ref m_RefillEventDisposed, 1) == 0)
+                AudioRefillRequested.Dispose();
+        }
 
         private void ReportAudioIssue(string reason)
         {
@@ -459,7 +560,8 @@
             var readableBytes = AudioBuffer?.ReadableCount ?? -1;
             this.LogWarning(
                 Aspects.AudioRenderer,
-                $"{reason} | count={issueCount} | readable={readableBytes} | state={MediaCore.State.MediaState}");
+                $"{reason} | count={issueCount} | readable={readableBytes} | " +
+                $"decoded={DecodedAudioBlockCount} | state={MediaCore.State.MediaState}");
         }
 
         /// <summary>
@@ -541,6 +643,15 @@
                     MediaElement.RendererOptions.LegacyAudioDevice?.DeviceId ?? -1);
                 AudioDevice.Start();
             }
+
+            Volatile.Write(ref m_RefillStopping, 0);
+            AudioRefillThread = new Thread(RunAudioRefill)
+            {
+                IsBackground = true,
+                Priority = ThreadPriority.Highest,
+                Name = $"{nameof(AudioRenderer)}.Refill",
+            };
+            AudioRefillThread.Start();
         }
 
         /// <summary>
@@ -549,26 +660,36 @@
         /// </summary>
         private void Destroy()
         {
+            IWavePlayer audioDevice;
+            CircularBuffer audioBuffer;
+            SoundTouch audioProcessor;
+            Thread audioRefillThread;
             lock (SyncLock)
             {
-                if (AudioDevice != null)
-                {
-                    AudioDevice.Dispose();
-                    AudioDevice = null;
-                }
-
-                if (AudioBuffer != null)
-                {
-                    AudioBuffer.Dispose();
-                    AudioBuffer = null;
-                }
-
-                if (AudioProcessor == null)
-                    return;
-
-                AudioProcessor.Dispose();
+                audioDevice = AudioDevice;
+                audioBuffer = AudioBuffer;
+                audioProcessor = AudioProcessor;
+                audioRefillThread = AudioRefillThread;
+                AudioDevice = null;
+                AudioBuffer = null;
                 AudioProcessor = null;
+                AudioRefillThread = null;
+                Volatile.Write(ref m_RefillStopping, 1);
+                Volatile.Write(ref m_LastReadableBytes, 0);
             }
+
+            // The audio worker can still be inside Read. Never join it while holding
+            // the same lock, and release buffers only after it has stopped.
+            audioDevice?.Dispose();
+            if (audioRefillThread != null)
+            {
+                AudioRefillRequested.Set();
+                if (!ReferenceEquals(audioRefillThread, Thread.CurrentThread))
+                    audioRefillThread.Join();
+            }
+
+            audioBuffer?.Dispose();
+            audioProcessor?.Dispose();
         }
 
         #endregion
@@ -844,11 +965,11 @@
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ReadAndUseAudioProcessor(int requestedBytes, double speedRatio)
         {
-            if (AudioProcessorBuffer == null || AudioProcessorBuffer.Length < Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio))
-                AudioProcessorBuffer = new short[Convert.ToInt32(requestedBytes * Constants.MaxSpeedRatio / Constants.AudioBytesPerSample)];
-
             var bytesToRead = Convert.ToInt32((requestedBytes * speedRatio).ToMultipleOf(SampleBlockSize));
             var samplesToRequest = requestedBytes / SampleBlockSize;
+            var requiredProcessorShorts = (Math.Max(requestedBytes, bytesToRead) + 1) / Constants.AudioBytesPerSample;
+            if (AudioProcessorBuffer == null || AudioProcessorBuffer.Length < requiredProcessorShorts)
+                AudioProcessorBuffer = new short[requiredProcessorShorts];
 
             // Set the new tempo (without changing the pitch) according to the speed ratio
             AudioProcessor.SetTempo(Convert.ToSingle(speedRatio));
@@ -867,7 +988,7 @@
 
             // Receiving samples from the processor
             var numSamples = AudioProcessor.ReceiveSamplesI16(AudioProcessorBuffer, Convert.ToUInt32(samplesToRequest));
-            Array.Clear(ReadBuffer, 0, ReadBuffer.Length);
+            Array.Clear(ReadBuffer, 0, requestedBytes);
             Buffer.BlockCopy(AudioProcessorBuffer, 0, ReadBuffer, 0, Convert.ToInt32(numSamples * SampleBlockSize));
         }
 
@@ -885,9 +1006,7 @@
             var isMuted = MediaCore.State.IsMuted || IsClosing == true;
             if (isMuted)
             {
-                for (var sourceBufferOffset = 0; sourceBufferOffset < requestedBytes; sourceBufferOffset++)
-                    targetBuffer[targetBufferOffset + sourceBufferOffset] = 0;
-
+                Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                 return;
             }
 
@@ -897,6 +1016,12 @@
 
             volume = volume.Clamp(Constants.MinVolume, Constants.MaxVolume);
             balance = balance.Clamp(Constants.MinBalance, Constants.MaxBalance);
+
+            if (volume == 1d && balance == 0d)
+            {
+                Buffer.BlockCopy(ReadBuffer, 0, targetBuffer, targetBufferOffset, requestedBytes);
+                return;
+            }
 
             var leftVolume = volume * (balance > 0 ? 1d - balance : 1d);
             var rightVolume = volume * (balance < 0 ? 1d + balance : 1d);

@@ -5,6 +5,7 @@
     using System.Collections.Generic;
     using System.Linq;
     using System.Runtime.CompilerServices;
+    using System.Threading;
 
     /// <summary>
     /// Represents a set of pre-allocated media blocks of the same media type.
@@ -137,6 +138,11 @@
         /// Gets the number of available playback blocks.
         /// </summary>
         public int Count { get { lock (SyncLock) return m_Count; } }
+
+        /// <summary>
+        /// Gets a lock-free count snapshot for diagnostics on the audio output thread.
+        /// </summary>
+        public int ApproximateCount => Volatile.Read(ref m_Count);
 
         /// <summary>
         /// Gets the usage percent from 0.0 to 1.0.

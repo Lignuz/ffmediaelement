@@ -22,6 +22,7 @@
         private static readonly TimeSpan MinimumCycleDuration = TimeSpan.FromMilliseconds(1);
 
         private readonly Thread WorkerThread;
+        private int m_MmcssRegistered;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="AudioWorkerBase"/> class.
@@ -40,6 +41,10 @@
             WorkerThread.Start();
         }
 
+        protected bool IsMmcssRegistered => Volatile.Read(ref m_MmcssRegistered) != 0;
+
+        protected bool IsWorkerThread => ReferenceEquals(WorkerThread, Thread.CurrentThread);
+
         /// <inheritdoc />
         protected override void Dispose(bool alsoManaged)
         {
@@ -57,6 +62,7 @@
         {
             var taskIndex = 0u;
             var mmcssHandle = NativeMethods.AvSetMmThreadCharacteristics(MmcssTaskName, ref taskIndex);
+            Volatile.Write(ref m_MmcssRegistered, mmcssHandle == IntPtr.Zero ? 0 : 1);
 
             try
             {

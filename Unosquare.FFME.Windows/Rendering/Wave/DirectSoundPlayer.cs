@@ -1,5 +1,6 @@
 ﻿namespace Unosquare.FFME.Rendering.Wave
 {
+    using Common;
     using Diagnostics;
     using Primitives;
     using System;
@@ -29,6 +30,8 @@
 
         // Instance fields
         private readonly EventWaitHandle CancelEvent = new EventWaitHandle(false, EventResetMode.ManualReset);
+        private readonly EventWaitHandle ClearEvent = new EventWaitHandle(false, EventResetMode.AutoReset);
+        private readonly EventWaitHandle ClearAcknowledgedEvent = new EventWaitHandle(false, EventResetMode.AutoReset);
 
         private readonly WaveFormat WaveFormat;
         private int SamplesTotalSize;
@@ -44,6 +47,18 @@
         private EventWaitHandle PlaybackEndedEventWaitHandle;
         private WaitHandle[] PlaybackWaitHandles;
         private DateTime LastWaitTimeoutLog;
+        private long m_StartTimestamp;
+        private long m_LastNotificationTimestamp;
+        private long m_LastOutputWarningTimestamp;
+        private long m_LastReadDurationTicks;
+        private long m_LastDeviceWriteDurationTicks;
+        private long m_DeadlineMissCount;
+        private long m_LastSeekTimestamp;
+        private int m_PreReadPcmMilliseconds;
+        private int m_PreReadDecodedBlocks;
+        private long m_ClearRequestGeneration;
+        private long m_ClearAcknowledgedGeneration;
+        private long m_LastClearTimeoutTimestamp;
 
         #endregion
 
@@ -80,7 +95,7 @@
         public bool IsRunning => WorkerState == WorkerState.Running;
 
         /// <inheritdoc />
-        // A larger device buffer tolerates short decoder or scheduler delays without audible gaps.
+        // Keep the existing 100 ms notification period and 200 ms device buffer.
         public int DesiredLatency { get; private set; } = 100;
 
         #endregion
@@ -124,6 +139,7 @@
                 PlaybackState = PlaybackState.Playing;
 
                 // Begin notifications on playback wait events
+                m_StartTimestamp = Stopwatch.GetTimestamp();
                 AudioBackBuffer.Play(0, 0, DirectSound.DirectSoundPlayFlags.Looping);
 
                 StartAsync();
@@ -138,7 +154,40 @@
         }
 
         /// <inheritdoc />
-        public void Clear() => ClearBackBuffer();
+        public void Clear()
+        {
+            if (IsDisposed || !IsRunning)
+                return;
+
+            var request = Interlocked.Increment(ref m_ClearRequestGeneration);
+            try { ClearEvent.Set(); }
+            catch (ObjectDisposedException) { return; }
+
+            // A user seek must not complete while samples from the previous
+            // generation are still queued in the device. The output worker owns
+            // the COM buffer; do not call it from the command thread.
+            if (IsWorkerThread)
+                return;
+
+            var wait = Stopwatch.StartNew();
+            while (!IsDisposed && Interlocked.Read(ref m_ClearAcknowledgedGeneration) < request &&
+                wait.ElapsedMilliseconds < DesiredLatency)
+            {
+                try { ClearAcknowledgedEvent.WaitOne(10); }
+                catch (ObjectDisposedException) { return; }
+            }
+
+            if (!IsDisposed && Interlocked.Read(ref m_ClearAcknowledgedGeneration) < request)
+            {
+                var now = Stopwatch.GetTimestamp();
+                var last = Interlocked.Read(ref m_LastClearTimeoutTimestamp);
+                if (last == 0 || Stopwatch.GetElapsedTime(last, now) >= TimeSpan.FromSeconds(1))
+                {
+                    Interlocked.Exchange(ref m_LastClearTimeoutTimestamp, now);
+                    this.LogWarning(Aspects.AudioRenderer, "DirectSound buffer clear was delayed after seek.");
+                }
+            }
+        }
 
         #endregion
 
@@ -150,6 +199,7 @@
             const int FrameStartHandle = 0;
             const int PlaybackEndHandle = 2;
             const int CancelHandle = 3;
+            const int ClearHandle = 4;
             const int TimeoutHandle = WaitHandle.WaitTimeout;
 
             // Wait for signals on frameEventWaitHandle1 (Position 0), frameEventWaitHandle2 (Position 1/2)
@@ -175,11 +225,33 @@
                 return;
             }
 
+            if (handleIndex == ClearHandle)
+            {
+                ProcessClearRequest();
+                return;
+            }
+
+            var notificationTimestamp = Stopwatch.GetTimestamp();
+            var previousTimestamp = Interlocked.Exchange(ref m_LastNotificationTimestamp, notificationTimestamp);
+            var notificationInterval = previousTimestamp == 0
+                ? TimeSpan.Zero
+                : Stopwatch.GetElapsedTime(previousTimestamp, notificationTimestamp);
+
+            ProcessClearRequest();
+
             NextSamplesWriteIndex = handleIndex == FrameStartHandle ? SamplesFrameSize : default;
 
             // Only carry on playing if we can read more samples
+            var feedStart = Stopwatch.GetTimestamp();
             if (FeedBackBuffer(SamplesFrameSize) <= 0)
                 throw new InvalidOperationException($"Method {nameof(FeedBackBuffer)} could not write samples.");
+
+            var feedDuration = Stopwatch.GetElapsedTime(feedStart);
+            if (notificationInterval.TotalMilliseconds > DesiredLatency * 1.5 ||
+                feedDuration.TotalMilliseconds > DesiredLatency * 0.5)
+            {
+                ReportOutputDelay(notificationTimestamp, notificationInterval, feedDuration);
+            }
         }
 
         /// <inheritdoc />
@@ -194,6 +266,7 @@
             // Signal Completion
             PlaybackState = PlaybackState.Stopped;
             CancelEvent.Set(); // causes the WaitAny to exit
+            ClearAcknowledgedEvent.Set();
 
             try { AudioBackBuffer?.Stop(); } catch { /* Ignore exception and continue */ }
             try { AudioRenderBuffer?.Stop(); } catch { /* Ignore exception and continue */ }
@@ -218,6 +291,8 @@
                 FrameStartEventWaitHandle?.Dispose();
                 FrameEndEventWaitHandle?.Dispose();
                 CancelEvent.Dispose();
+                ClearEvent.Dispose();
+                ClearAcknowledgedEvent.Dispose();
 
                 PlaybackWaitHandles = null;
                 AudioBackBuffer = null;
@@ -280,6 +355,41 @@
                 Offset = offset,
                 NotifyHandle = eventHandle.SafeWaitHandle.DangerousGetHandle()
             };
+
+        private void ReportOutputDelay(long timestamp, TimeSpan notificationInterval, TimeSpan feedDuration)
+        {
+            if (Renderer?.MediaCore.State.MediaState != MediaPlaybackState.Play ||
+                Stopwatch.GetElapsedTime(m_StartTimestamp, timestamp) < TimeSpan.FromSeconds(1) ||
+                (m_LastSeekTimestamp != 0 && Stopwatch.GetElapsedTime(m_LastSeekTimestamp, timestamp) < TimeSpan.FromSeconds(1)))
+                return;
+
+            Interlocked.Increment(ref m_DeadlineMissCount);
+            var last = Interlocked.Read(ref m_LastOutputWarningTimestamp);
+            if (last != 0 && Stopwatch.GetElapsedTime(last, timestamp) < TimeSpan.FromSeconds(1))
+                return;
+            if (Interlocked.CompareExchange(ref m_LastOutputWarningTimestamp, timestamp, last) != last)
+                return;
+
+            this.LogWarning(Aspects.AudioRenderer,
+                $"AUDIO OUTPUT LATE: notification={notificationInterval.TotalMilliseconds:0} ms, " +
+                $"feed={feedDuration.TotalMilliseconds:0} ms, read={TimeSpan.FromTicks(Interlocked.Read(ref m_LastReadDurationTicks)).TotalMilliseconds:0} ms, " +
+                $"deviceWrite={TimeSpan.FromTicks(Interlocked.Read(ref m_LastDeviceWriteDurationTicks)).TotalMilliseconds:0} ms, " +
+                $"pcm={Volatile.Read(ref m_PreReadPcmMilliseconds)}->{Renderer.BufferedAudioMilliseconds} ms, " +
+                $"decoded={Volatile.Read(ref m_PreReadDecodedBlocks)}->{Renderer.DecodedAudioBlockCount} blocks, " +
+                $"misses={Interlocked.Read(ref m_DeadlineMissCount)}, mmcss={IsMmcssRegistered}");
+        }
+
+        private void ProcessClearRequest()
+        {
+            var request = Interlocked.Read(ref m_ClearRequestGeneration);
+            if (request <= Interlocked.Read(ref m_ClearAcknowledgedGeneration))
+                return;
+
+            m_LastSeekTimestamp = Stopwatch.GetTimestamp();
+            ClearBackBuffer();
+            Interlocked.Exchange(ref m_ClearAcknowledgedGeneration, request);
+            ClearAcknowledgedEvent.Set();
+        }
 
         /// <summary>
         /// Initializes the direct sound.
@@ -364,7 +474,7 @@
             FrameStartEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
             FrameEndEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
             PlaybackEndedEventWaitHandle = new EventWaitHandle(false, EventResetMode.AutoReset);
-            PlaybackWaitHandles = new WaitHandle[] { FrameStartEventWaitHandle, FrameEndEventWaitHandle, PlaybackEndedEventWaitHandle, CancelEvent };
+            PlaybackWaitHandles = new WaitHandle[] { FrameStartEventWaitHandle, FrameEndEventWaitHandle, PlaybackEndedEventWaitHandle, CancelEvent, ClearEvent };
 
             var notificationEvents = new[]
             {
@@ -420,7 +530,7 @@
             if (AudioBackBuffer == null || SamplesTotalSize <= 0)
                 return;
 
-            var silence = new byte[SamplesTotalSize];
+            Array.Clear(Samples, 0, SamplesTotalSize);
 
             var isLocked = false;
             IntPtr wavBuffer1 = IntPtr.Zero;
@@ -440,9 +550,9 @@
 
                 if (wavBuffer1 != IntPtr.Zero)
                 {
-                    Marshal.Copy(silence, 0, wavBuffer1, nbSamples1);
+                    Marshal.Copy(Samples, 0, wavBuffer1, nbSamples1);
                     if (wavBuffer2 != IntPtr.Zero)
-                        Marshal.Copy(silence, nbSamples1, wavBuffer2, nbSamples2);
+                        Marshal.Copy(Samples, nbSamples1, wavBuffer2, nbSamples2);
                 }
             }
             finally
@@ -467,7 +577,18 @@
                 AudioBackBuffer.Restore();
 
             // Read data from stream (Should this be inserted between the lock / unlock?)
+            var generation = Renderer?.SeekGeneration ?? 0;
+            Renderer?.RequestRefillIfLow();
+            Volatile.Write(ref m_PreReadPcmMilliseconds, Renderer?.BufferedAudioMilliseconds ?? 0);
+            Volatile.Write(ref m_PreReadDecodedBlocks, Renderer?.DecodedAudioBlockCount ?? 0);
+            var readStart = Stopwatch.GetTimestamp();
             var bytesRead = Renderer?.Read(Samples, 0, bytesToCopy) ?? 0;
+            Interlocked.Exchange(ref m_LastReadDurationTicks, Stopwatch.GetElapsedTime(readStart).Ticks);
+
+            // A seek can complete while the output worker is preparing a buffer.
+            // Never enqueue samples from the previous playback generation.
+            if (generation != (Renderer?.SeekGeneration ?? 0) && bytesRead > 0)
+                Array.Clear(Samples, 0, bytesRead);
 
             // Write silence
             if (bytesRead <= 0)
@@ -481,6 +602,7 @@
             IntPtr wavBuffer2 = IntPtr.Zero;
             var nbSamples1 = 0;
             var nbSamples2 = 0;
+            var writeStart = Stopwatch.GetTimestamp();
             try
             {
                 AudioBackBuffer.Lock(NextSamplesWriteIndex,
@@ -494,6 +616,8 @@
 
                 if (wavBuffer1 != IntPtr.Zero)
                 {
+                    if (generation != (Renderer?.SeekGeneration ?? 0))
+                        Array.Clear(Samples, 0, bytesRead);
                     Marshal.Copy(Samples, 0, wavBuffer1, nbSamples1);
                     if (wavBuffer2 != IntPtr.Zero)
                         Marshal.Copy(Samples, nbSamples1, wavBuffer2, nbSamples2);
@@ -503,6 +627,7 @@
             {
                 if (isLocked)
                     AudioBackBuffer.Unlock(wavBuffer1, nbSamples1, wavBuffer2, nbSamples2);
+                Interlocked.Exchange(ref m_LastDeviceWriteDurationTicks, Stopwatch.GetElapsedTime(writeStart).Ticks);
             }
 
             return bytesRead;

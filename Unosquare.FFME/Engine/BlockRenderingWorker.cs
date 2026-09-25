@@ -530,11 +530,13 @@ namespace Unosquare.FFME.Engine
                 return;
             }
 
-            // Keep the master clock on the audio output instead of pausing it. While the
-            // clock is paused the audio renderer only outputs silence, so a lagging audio
-            // output could never catch up and playback would stall until the next command.
+            // Audio is the playback reference. A delayed video frame must be dropped
+            // until video catches up; pausing this clock also silences healthy audio.
             if (main == MediaType.Audio)
+            {
                 RealignClockToAudioOutput(main);
+                return;
+            }
 
             // A previous sync-buffering wait timed out. Give the decoder some time
             // before pausing the clock for the secondary components again.
