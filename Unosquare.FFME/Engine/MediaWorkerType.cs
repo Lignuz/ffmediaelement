@@ -18,6 +18,11 @@
         /// <summary>
         /// The block rendering worker.
         /// </summary>
-        Render
+        Render,
+
+        /// <summary>
+        /// The audio decoding worker used when the media has both audio and video.
+        /// </summary>
+        AudioDecode,
     }
 }

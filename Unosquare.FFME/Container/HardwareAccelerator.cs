@@ -1,15 +1,21 @@
 ﻿namespace Unosquare.FFME.Container
 {
     using Common;
+    using Diagnostics;
     using FFmpeg.AutoGen;
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
 
     /// <summary>
     /// Encapsulates Hardware Accelerator Properties.
     /// </summary>
     internal sealed unsafe class HardwareAccelerator
     {
+        private bool m_HardwareFormatRequested;
+        private bool m_IsHardwareUnavailable;
+        private int m_ReportedMode;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="HardwareAccelerator"/> class.
         /// </summary>
@@ -97,19 +103,19 @@
         /// <exception cref="Exception">Failed to transfer data to output frame.</exception>
         public AVFrame* ExchangeFrame(AVCodecContext* codecContext, AVFrame* input, out bool isHardwareFrame)
         {
-            isHardwareFrame = false;
+            // Only frames that actually live in the device surface format were decoded by the
+            // hardware. A device can be attached while the codec falls back to software.
+            isHardwareFrame = codecContext->hw_device_ctx != null && input->format == (int)PixelFormat;
+            ReportDecodingMode(isHardwareFrame, (AVPixelFormat)input->format);
 
-            if (codecContext->hw_device_ctx == null)
-                return input;
-
-            isHardwareFrame = true;
-
-            if (input->format != (int)PixelFormat)
+            if (!isHardwareFrame)
                 return input;
 
             var output = MediaFrame.CreateAVFrame();
 
+            var transferStart = Stopwatch.GetTimestamp();
             var result = ffmpeg.av_hwframe_transfer_data(output, input, 0);
+            VideoPipelineStatistics.AddTransfer(Stopwatch.GetTimestamp() - transferStart);
             ffmpeg.av_frame_copy_props(output, input);
             if (result < 0)
             {
@@ -123,33 +129,70 @@
         }
 
         /// <summary>
-        /// Gets the pixel format.
-        /// Port of (get_format) method in ffmpeg.c.
+        /// Determines whether the pixel format is a hardware surface format.
         /// </summary>
+        /// <param name="format">The pixel format.</param>
+        /// <returns>Whether the format refers to hardware surfaces.</returns>
+        private static bool IsHardwareFormat(AVPixelFormat format)
+        {
+            var descriptor = ffmpeg.av_pix_fmt_desc_get(format);
+            return descriptor != null && (descriptor->flags & (ulong)ffmpeg.AV_PIX_FMT_FLAG_HWACCEL) != 0;
+        }
+
+        /// <summary>
+        /// Selects the pixel format for the decoder. Port of (get_format) method in ffmpeg.c.
+        /// </summary>
+        /// <remarks>
+        /// When the hardware format is chosen but the hardware decoder cannot be initialized
+        /// (e.g. the GPU does not support the codec profile), FFmpeg calls this callback again
+        /// without that format. That failure is remembered so the stream does not retry the
+        /// hardware decoder every time the decoder is reconfigured.
+        /// </remarks>
         /// <param name="context">The codec context.</param>
-        /// <param name="pixelFormats">The pixel formats.</param>
-        /// <returns>The real pixel format that the codec will be using.</returns>
+        /// <param name="pixelFormats">The pixel formats, terminated by <see cref="AVPixelFormat.AV_PIX_FMT_NONE"/>.</param>
+        /// <returns>The pixel format that the codec will be using.</returns>
         private AVPixelFormat GetPixelFormat(AVCodecContext* context, AVPixelFormat* pixelFormats)
         {
-            // The default output is the first pixel format found.
-            var output = *pixelFormats;
-
-            // Iterate throughout the different pixel formats provided by the codec
+            var offersHardwareFormat = false;
+            var softwareFormat = AVPixelFormat.AV_PIX_FMT_NONE;
             for (var p = pixelFormats; *p != AVPixelFormat.AV_PIX_FMT_NONE; p++)
             {
-                // Try to select a hardware output pixel format that matches the HW device
                 if (*p == PixelFormat)
-                {
-                    output = PixelFormat;
-                    break;
-                }
-
-                // Otherwise, just use the default SW pixel format
-                output = *p;
+                    offersHardwareFormat = true;
+                else if (softwareFormat == AVPixelFormat.AV_PIX_FMT_NONE && !IsHardwareFormat(*p))
+                    softwareFormat = *p;
             }
 
-            // Return the current pixel format.
-            return output;
+            if (!offersHardwareFormat && m_HardwareFormatRequested && !m_IsHardwareUnavailable)
+            {
+                m_IsHardwareUnavailable = true;
+                Component.LogInfo(Aspects.Component,
+                    $"VIDEO DECODER: {Name} could not decode {Component.CodecName}; using software decoding.");
+            }
+
+            m_HardwareFormatRequested = offersHardwareFormat && !m_IsHardwareUnavailable;
+            if (m_HardwareFormatRequested)
+                return PixelFormat;
+
+            // Use the first software format, which is the codec's preferred output.
+            return softwareFormat != AVPixelFormat.AV_PIX_FMT_NONE ? softwareFormat : *pixelFormats;
+        }
+
+        /// <summary>
+        /// Logs the decoding path whenever it changes (first frame, hardware to software and back).
+        /// </summary>
+        /// <param name="isHardwareFrame">Whether the frame was decoded by the hardware.</param>
+        /// <param name="format">The decoded frame format.</param>
+        private void ReportDecodingMode(bool isHardwareFrame, AVPixelFormat format)
+        {
+            var mode = isHardwareFrame ? 1 : 2;
+            if (m_ReportedMode == mode)
+                return;
+
+            m_ReportedMode = mode;
+            Component.LogInfo(Aspects.Component, isHardwareFrame
+                ? $"VIDEO DECODER: {Name} hwaccel decoding {Component.CodecName} (frames in GPU surfaces)."
+                : $"VIDEO DECODER: software decoding {Component.CodecName} ({format}) although {Name} is attached.");
         }
     }
 }

@@ -336,7 +336,7 @@ internal abstract class WorkerBase : IWorker
                 if (IsDisposed || IsDisposing)
                     break;
 
-                Interrupt();
+                InterruptPendingStateChange();
             }
         }
         catch (ObjectDisposedException)
@@ -346,4 +346,30 @@ internal abstract class WorkerBase : IWorker
 
         return WorkerState;
     });
+
+    /// <summary>
+    /// Interrupts the current cycle so that a pending state change is applied sooner.
+    /// </summary>
+    /// <remarks>
+    /// The wait can time out just as the worker applies the wanted state and begins a new
+    /// cycle. Cancelling at that point would abort the new cycle (e.g. a seek queued right
+    /// after the media was opened), so nothing is interrupted once the state was reached.
+    /// </remarks>
+    private void InterruptPendingStateChange()
+    {
+        lock (SyncLock)
+        {
+            if (IsDisposed || IsDisposing || WantedStateCompleted.IsSet)
+                return;
+
+            try
+            {
+                TokenSource.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A wait task can wake after Dispose has released the token source.
+            }
+        }
+    }
 }

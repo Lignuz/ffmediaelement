@@ -22,6 +22,12 @@
         private readonly Action<IEnumerable<MediaType>, CancellationToken> ParallelDecodeBlocks;
 
         /// <summary>
+        /// Held by the audio worker while it decodes, so that the audio packet and codec state
+        /// can be inspected from the main decoding worker without seeing a half-updated state.
+        /// </summary>
+        private readonly object AudioCycleLock = new();
+
+        /// <summary>
         /// The decoded frame count for a cycle. This is used to detect end of decoding scenarios.
         /// </summary>
         private int DecodedFrameCount;
@@ -30,12 +36,14 @@
         /// Initializes a new instance of the <see cref="FrameDecodingWorker"/> class.
         /// </summary>
         /// <param name="mediaCore">The media core.</param>
-        public FrameDecodingWorker(MediaEngine mediaCore)
-            : base(nameof(FrameDecodingWorker), ThreadPriority.Highest)
+        /// <param name="isAudioWorker">Whether this worker only decodes audio for media that also has video.</param>
+        public FrameDecodingWorker(MediaEngine mediaCore, bool isAudioWorker)
+            : base(isAudioWorker ? "AudioFrameDecodingWorker" : nameof(FrameDecodingWorker), ThreadPriority.Highest)
         {
             MediaCore = mediaCore;
             Container = mediaCore.Container;
             State = mediaCore.State;
+            IsAudioWorker = isAudioWorker;
 
             ParallelDecodeBlocks = (all, ct) =>
             {
@@ -46,9 +54,21 @@
 
             SerialDecodeBlocks = (all, ct) =>
             {
+                // A video frame can take long to decode (high resolutions, hybrid hardware
+                // decoders, or decoder helper threads starved by a CPU-bound foreground
+                // application). Audio is then decoded by the dedicated audio worker.
+                var skipAudio = IsAudioDecodedSeparately;
                 foreach (var t in Container.Components.MediaTypes)
+                {
+                    if (skipAudio && t == MediaType.Audio)
+                        continue;
+
                     DecodedFrameCount += DecodeComponentBlocks(t, ct);
+                }
             };
+
+            if (isAudioWorker)
+                return;
 
             Container.Components.OnFrameDecoded = (frame, type) =>
             {
@@ -91,9 +111,52 @@
         /// </summary>
         private bool UseParallelDecoding => MediaCore.Timing.HasDisconnectedClocks || Container.MediaOptions.UseParallelDecoding;
 
+        /// <summary>
+        /// Gets a value indicating whether this worker only decodes audio.
+        /// </summary>
+        private bool IsAudioWorker { get; }
+
+        /// <summary>
+        /// Gets a value indicating whether audio is decoded by the dedicated audio worker.
+        /// </summary>
+        private bool IsAudioDecodedSeparately =>
+            !UseParallelDecoding && Container.Components.HasAudio && Container.Components.HasVideo;
+
+        /// <summary>
+        /// Determines whether all the audio has been decoded into blocks by this audio worker.
+        /// A packet leaves the queue before the codec is marked as holding it, so this returns
+        /// false while a decoding cycle is in progress instead of reading that state mid-update.
+        /// </summary>
+        /// <returns>True if no more audio frames can be decoded.</returns>
+        internal bool HasDecodedAllAudio()
+        {
+            if (!Monitor.TryEnter(AudioCycleLock))
+                return false;
+
+            try
+            {
+                return !CanReadMoreFramesOf(MediaType.Audio);
+            }
+            finally
+            {
+                Monitor.Exit(AudioCycleLock);
+            }
+        }
+
         /// <inheritdoc />
         protected override void ExecuteCycleLogic(CancellationToken ct)
         {
+            if (IsAudioWorker)
+            {
+                lock (AudioCycleLock)
+                {
+                    if (IsAudioDecodedSeparately && !MediaCore.HasDecodingEnded && !ct.IsCancellationRequested)
+                        DecodeComponentBlocks(MediaType.Audio, ct);
+                }
+
+                return;
+            }
+
             try
             {
                 if (MediaCore.HasDecodingEnded || ct.IsCancellationRequested)
@@ -171,9 +234,14 @@
         /// </summary>
         /// <returns>True if media docding has ended.</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private bool DetectHasDecodingEnded() =>
-            DecodedFrameCount <= 0 &&
-            CanReadMoreFramesOf(Container.Components.SeekableMediaType) == false;
+        private bool DetectHasDecodingEnded()
+        {
+            if (DecodedFrameCount > 0 || CanReadMoreFramesOf(Container.Components.SeekableMediaType))
+                return false;
+
+            // The remaining audio is decoded by the audio worker; wait until it is done too.
+            return !IsAudioDecodedSeparately || MediaCore.Workers?.AudioDecoding.HasDecodedAllAudio() == true;
+        }
 
         /// <summary>
         /// Gets a value indicating whether more frames can be decoded into blocks of the given type.
@@ -185,8 +253,10 @@
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool CanReadMoreFramesOf(MediaType t)
         {
+            // Count packets rather than bytes: the empty packet queued at the end of the stream
+            // has no data, but it still has to reach the decoder to drain its remaining frames.
             return
-                Container.Components[t].BufferLength > 0 ||
+                Container.Components[t].BufferCount > 0 ||
                 Container.Components[t].HasPacketsInCodec ||
                 MediaCore.ShouldReadMorePackets;
         }

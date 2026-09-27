@@ -8,6 +8,7 @@
     using Platform;
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Runtime.CompilerServices;
     using System.Windows.Media;
     using System.Windows.Media.Imaging;
@@ -90,13 +91,18 @@
             var block = BeginRenderingCycle(mediaBlock);
             if (block == null) return;
 
+            var dispatchStart = Stopwatch.GetTimestamp();
             VideoDispatcher?.Invoke(() =>
             {
                 try
                 {
                     // Prepare and write frame data
-                    if (PrepareVideoFrameBuffer(block))
-                        WriteVideoFrameBuffer(block, clockPosition);
+                    var uiStart = Stopwatch.GetTimestamp();
+                    if (PrepareVideoFrameBuffer(block) && WriteVideoFrameBuffer(block, clockPosition, out var copyTicks))
+                    {
+                        VideoPipelineStatistics.AddPresentation(
+                            uiStart - dispatchStart, Stopwatch.GetTimestamp() - uiStart, copyTicks);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -149,13 +155,16 @@
         /// </summary>
         /// <param name="block">The source.</param>
         /// <param name="clockPosition">Current clock position.</param>
+        /// <param name="copyTicks">The <see cref="Stopwatch"/> ticks spent copying the pixels.</param>
+        /// <returns>True if the frame was written to the target bitmap.</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private unsafe void WriteVideoFrameBuffer(VideoBlock block, TimeSpan clockPosition)
+        private unsafe bool WriteVideoFrameBuffer(VideoBlock block, TimeSpan clockPosition, out long copyTicks)
         {
+            copyTicks = 0;
             var bitmap = TargetBitmap;
             var target = TargetBitmapData;
             if (bitmap == null || target == null || block == null || block.IsDisposed || !block.TryAcquireReaderLock(out var readLock))
-                return;
+                return false;
 
             // Lock the video block for reading
             try
@@ -168,11 +177,13 @@
                 var bufferLength = Math.Min(block.BufferLength, target.BufferLength);
 
                 // Copy the block data into the back buffer of the target bitmap.
+                var copyStart = Stopwatch.GetTimestamp();
                 Buffer.MemoryCopy(
                     block.Buffer.ToPointer(),
                     target.Scan0.ToPointer(),
                     bufferLength,
                     bufferLength);
+                copyTicks = Stopwatch.GetTimestamp() - copyStart;
 
                 // with the locked video block, raise the rendering video event.
                 MediaElement?.RaiseRenderingVideoEvent(block, target, clockPosition);
@@ -185,6 +196,8 @@
                 readLock.Dispose();
                 bitmap.Unlock();
             }
+
+            return true;
         }
     }
 }

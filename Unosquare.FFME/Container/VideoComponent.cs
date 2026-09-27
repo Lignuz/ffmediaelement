@@ -5,6 +5,7 @@ using Diagnostics;
 using FFmpeg.AutoGen;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 /// <summary>
@@ -254,6 +255,7 @@ internal sealed unsafe class VideoComponent : MediaComponent
                 targetScan[0] = (byte*)target.Buffer;
 
                 // The scaling is done here
+                var convertStart = Stopwatch.GetTimestamp();
                 var outputHeight = ffmpeg.sws_scale(
                     Scaler,
                     source.Pointer->data,
@@ -262,6 +264,7 @@ internal sealed unsafe class VideoComponent : MediaComponent
                     source.Pointer->height,
                     targetScan,
                     targetStride);
+                VideoPipelineStatistics.AddConversion(Stopwatch.GetTimestamp() - convertStart);
 
                 if (outputHeight <= 0)
                     return false;

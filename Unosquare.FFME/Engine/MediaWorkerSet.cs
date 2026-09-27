@@ -12,7 +12,7 @@
     internal sealed class MediaWorkerSet : IDisposable
     {
         private readonly object SyncLock = new object();
-        private readonly IMediaWorker[] Workers = new IMediaWorker[3];
+        private readonly IMediaWorker[] Workers = new IMediaWorker[4];
         private bool m_IsDisposed;
 
         /// <summary>
@@ -24,12 +24,14 @@
             MediaCore = mediaCore;
 
             Reading = new PacketReadingWorker(mediaCore);
-            Decoding = new FrameDecodingWorker(mediaCore);
+            Decoding = new FrameDecodingWorker(mediaCore, false);
+            AudioDecoding = new FrameDecodingWorker(mediaCore, true);
             Rendering = new BlockRenderingWorker(mediaCore);
 
             Workers[(int)MediaWorkerType.Read] = Reading;
             Workers[(int)MediaWorkerType.Decode] = Decoding;
             Workers[(int)MediaWorkerType.Render] = Rendering;
+            Workers[(int)MediaWorkerType.AudioDecode] = AudioDecoding;
         }
 
         /// <summary>
@@ -46,6 +48,12 @@
         /// Gets the frame decoding worker.
         /// </summary>
         public FrameDecodingWorker Decoding { get; }
+
+        /// <summary>
+        /// Gets the audio frame decoding worker. It decodes audio on its own thread when the
+        /// media has both audio and video, so slow video frames cannot delay the audio.
+        /// </summary>
+        public FrameDecodingWorker AudioDecoding { get; }
 
         /// <summary>
         /// Gets the block rendering worker.
@@ -110,7 +118,7 @@
         public void ResumePaused() => Resume(
             true,
             Reading.WorkerState == WorkerState.Paused,
-            Decoding.WorkerState == WorkerState.Paused,
+            Decoding.WorkerState == WorkerState.Paused || AudioDecoding.WorkerState == WorkerState.Paused,
             Rendering.WorkerState == WorkerState.Paused);
 
         /// <inheritdoc />
@@ -161,7 +169,12 @@
             var workers = new List<IMediaWorker>(3);
 
             if (read) workers.Add(Reading);
-            if (decode) workers.Add(Decoding);
+            if (decode)
+            {
+                workers.Add(Decoding);
+                workers.Add(AudioDecoding);
+            }
+
             if (render) workers.Add(Rendering);
 
             foreach (var worker in workers)

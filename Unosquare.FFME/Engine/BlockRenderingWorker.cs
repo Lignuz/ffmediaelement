@@ -37,6 +37,7 @@ namespace Unosquare.FFME.Engine
         private DateTime LastAudioRealignLogTime;
         private DateTime LastDecodeStarvationLogTime;
         private DateTime ClockResumedTime;
+        private TimeSpan LastStaleVideoBlockStart = TimeSpan.MinValue;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BlockRenderingWorker"/> class.
@@ -430,6 +431,7 @@ namespace Unosquare.FFME.Engine
                 $" | decoding ended={MediaCore.HasDecodingEnded}" +
                 $" | reading cycle: {Describe(workers?.Reading, now)}" +
                 $" | decoding cycle: {Describe(workers?.Decoding, now)}" +
+                $" | audio decoding cycle: {Describe(workers?.AudioDecoding, now)}" +
                 $" | GC {GC.CollectionCount(0)}/{GC.CollectionCount(1)}/{GC.CollectionCount(2)}, pause total {GC.GetTotalPauseDuration().TotalMilliseconds:0} ms";
         }
 
@@ -746,10 +748,21 @@ namespace Unosquare.FFME.Engine
                     playbackClock.Ticks - currentBlock.EndTime.Ticks > MinimumSyncBufferLag.Ticks)
                 {
                     // Never present a materially stale frame while audio is the
-                    // master clock. The sync-buffering check will pause the clock
-                    // when the decoder has not produced newer video yet.
+                    // master clock. Video catches up by dropping frames until
+                    // the decoder produces one for the current audio position.
+                    if (currentBlock.StartTime != LastStaleVideoBlockStart)
+                    {
+                        LastStaleVideoBlockStart = currentBlock.StartTime;
+                        VideoPipelineStatistics.AddStaleFrameSkipped();
+                    }
+
                     return result > 0;
                 }
+
+                // Video is current again, so the next stale frame is counted even if it
+                // has the same start time as the last one (e.g. after seeking back).
+                if (t == MediaType.Video)
+                    LastStaleVideoBlockStart = TimeSpan.MinValue;
 
                 // Send the block to the corresponding renderer
                 // this will handle fringe and skip cases

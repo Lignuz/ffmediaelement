@@ -5,6 +5,7 @@
     using FFmpeg.AutoGen;
     using Primitives;
     using System;
+    using System.Diagnostics;
     using System.Globalization;
     using System.Runtime.CompilerServices;
 
@@ -587,8 +588,11 @@
 
                 // Send packet to the decoder but prevent null packets to be sent to it
                 // Null packets have never been detected but it's just a safeguard
+                var sendStart = Stopwatch.GetTimestamp();
                 sendPacketResult = packet.SafePointer != IntPtr.Zero
                     ? ffmpeg.avcodec_send_packet(CodecContext, packet.Pointer) : -ffmpeg.EINVAL;
+                if (MediaType == MediaType.Video)
+                    VideoPipelineStatistics.AddDecodeTime(Stopwatch.GetTimestamp() - sendStart);
 
                 // EAGAIN means we have filled the decoder buffer
                 if (sendPacketResult != -ffmpeg.EAGAIN)
@@ -623,7 +627,14 @@
         {
             MediaFrame managedFrame = null;
             var outputFrame = MediaFrame.CreateAVFrame();
+            var receiveStart = Stopwatch.GetTimestamp();
             receiveFrameResult = ffmpeg.avcodec_receive_frame(CodecContext, outputFrame);
+            if (MediaType == MediaType.Video)
+            {
+                VideoPipelineStatistics.AddDecodeTime(Stopwatch.GetTimestamp() - receiveStart);
+                if (receiveFrameResult >= 0)
+                    VideoPipelineStatistics.AddDecodedFrame();
+            }
 
             if (receiveFrameResult >= 0)
                 managedFrame = CreateFrameSource(new IntPtr(outputFrame));
