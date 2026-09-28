@@ -35,6 +35,7 @@
             private set
             {
                 m_IsSeeking.Value = value;
+                MediaCore.Workers?.Rendering?.ResetPlaybackMainType();
                 State.ReportCommandStatus();
             }
         }
@@ -215,6 +216,9 @@
                 // 키 프레임 탐색
                 // Populate frame queues with after-seek operation
                 var firstFrame = MediaCore.Container.Seek(adjustedSeekTarget);
+
+                // The stream was repositioned, so the audio has to be decoded to its end again.
+                MediaCore.HasAudioDecodingEnded = false;
                 if (firstFrame != null)
                 {
                     // if we seeked to minvalue we really meant the first frame start time

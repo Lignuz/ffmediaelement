@@ -24,6 +24,9 @@
         #region Private Members
 
         private const int SyncLockTimeout = 100;
+        private static readonly TimeSpan AudioGapTolerance = TimeSpan.FromMilliseconds(10);
+        private static readonly TimeSpan AudioGapWarningGrace = TimeSpan.FromMilliseconds(250);
+        private static readonly TimeSpan AudioEndWarningGrace = TimeSpan.FromMilliseconds(200);
 
         private readonly AtomicBoolean IsClosing = new(false);
         private readonly object SyncLock = new();
@@ -39,6 +42,8 @@
         private long m_LastAudioIssueLogTimestamp;
         private long m_SeekGeneration;
         private int m_LastReadableBytes;
+        private int m_IsWaitingAtAudioGap;
+        private long m_WaitingAudioGapEndTicks;
         private int m_RefillStopping;
         private int m_RefillEventDisposed;
         private Thread AudioRefillThread;
@@ -150,6 +155,19 @@
         internal int DecodedAudioBlockCount => MediaCore.Blocks[MediaType.Audio].ApproximateCount;
 
         /// <summary>
+        /// Gets a value indicating whether silence is expected: after playback has ended, after the last
+        /// decoded audio of an ended audio stream was written, while the video continues through an audio
+        /// gap or tail, or while the output waits for the audio after a timestamp gap.
+        /// </summary>
+        private bool IsSilenceExpected =>
+            MediaCore.State.HasMediaEnded || MediaCore.Workers?.Rendering.IsPlayingWithoutAudio == true ||
+            (Volatile.Read(ref m_IsWaitingAtAudioGap) != 0 &&
+                MediaCore.PlaybackPosition.Ticks <= Volatile.Read(ref m_WaitingAudioGapEndTicks) + AudioGapWarningGrace.Ticks) ||
+            (MediaCore.HasAudioDecodingEnded && AudioBuffer != null &&
+                AudioBuffer.WriteTag >= MediaCore.Blocks[MediaType.Audio].ApproximateRangeEndTime &&
+                MediaCore.PlaybackPosition >= MediaCore.Blocks[MediaType.Audio].ApproximateRangeEndTime - AudioEndWarningGrace);
+
+        /// <summary>
         /// Gets or sets a value indicating whether this instance has fired the audio device stopped event.
         /// </summary>
         private bool HasFiredAudioDeviceStopped
@@ -167,8 +185,9 @@
         {
             lock (SyncLock)
             {
+                // Without samples written since the output was reset (e.g. by a seek), the position is unknown.
                 if (AudioBuffer == null || AudioDevice?.IsRunning != true ||
-                    m_HasFiredAudioDeviceStopped || IsClosing.Value)
+                    m_HasFiredAudioDeviceStopped || IsClosing.Value || AudioBuffer.WriteTag == TimeSpan.MinValue)
                 {
                     position = default;
                     return false;
@@ -231,6 +250,8 @@
             lock (SyncLock)
             {
                 AudioBuffer?.Clear();
+                Volatile.Write(ref m_IsWaitingAtAudioGap, 0);
+                Volatile.Write(ref m_WaitingAudioGapEndTicks, 0);
                 Volatile.Write(ref m_LastReadableBytes, 0);
                 directSound = AudioDevice as DirectSoundPlayer;
             }
@@ -311,7 +332,10 @@
                 if (AudioBuffer == null || AudioBuffer.ReadableCount <= 0)
                 {
                     Volatile.Write(ref m_LastReadableBytes, 0);
-                    ReportAudioIssue("Audio buffer underrun");
+
+                    // Silence is expected once the audio stream has ended (e.g. the video continues longer).
+                    if (!IsSilenceExpected)
+                        ReportAudioIssue("Audio buffer underrun");
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                     return requestedBytes;
                 }
@@ -354,7 +378,7 @@
                     if (bytesToRead > 0)
                         AudioBuffer.Read(bytesToRead, ReadBuffer, 0);
 
-                    if (bytesToRead < requestedBytes)
+                    if (bytesToRead < requestedBytes && !IsSilenceExpected)
                         ReportAudioIssue($"Audio buffer short read: requested={requestedBytes}, available={readableBytes}");
                 }
 
@@ -458,6 +482,25 @@
                 if (audioBuffer == null || audioBlocks == null || audioBlock == null)
                     return;
 
+                // A lookup inside a gap can return the already ended block. Skip it instead
+                // of filling a newly cleared output buffer with audio from before the seek.
+                if (audioBlock.EndTime <= clockPosition)
+                {
+                    audioBlock = audioBlocks.Next(audioBlock) as AudioBlock;
+                    if (audioBlock == null)
+                    {
+                        SetWaitingAtAudioGap(expectedGeneration, audioBuffer, false, TimeSpan.Zero);
+                        return;
+                    }
+                }
+
+                // The lookup can also return the next block before its presentation time.
+                if (audioBlock.StartTime - clockPosition > AudioGapTolerance)
+                {
+                    SetWaitingAtAudioGap(expectedGeneration, audioBuffer, true, audioBlock.StartTime);
+                    return;
+                }
+
                 while (audioBlock != null)
                 {
                     if (audioBlock.TryAcquireReaderLock(out var readLock) == false)
@@ -476,6 +519,7 @@
                             if (audioBuffer.WriteTag.Ticks < audioBlock.EndTime.Ticks)
                             {
                                 audioBuffer.Write(audioBlock.Buffer, audioBlock.SamplesBufferLength, audioBlock.EndTime, true);
+                                Volatile.Write(ref m_IsWaitingAtAudioGap, 0);
                             }
 
                             // Stop adding if we have too much in there.
@@ -486,14 +530,35 @@
                         if (stopFilling)
                             break;
 
-                        // Retrieve the following block
-                        audioBlock = audioBlocks.Next(audioBlock) as AudioBlock;
+                        // The PCM ring buffer has no timestamps between blocks. Stop at a real
+                        // gap so audio from after it is not played before its presentation time.
+                        // The silence played until the rendering worker writes that block is expected.
+                        var nextBlock = audioBlocks.Next(audioBlock) as AudioBlock;
+                        if (nextBlock != null && nextBlock.StartTime - audioBlock.EndTime > AudioGapTolerance)
+                        {
+                            SetWaitingAtAudioGap(expectedGeneration, audioBuffer, true, nextBlock.StartTime);
+                            nextBlock = null;
+                        }
+
+                        audioBlock = nextBlock;
                     }
                 }
             }
             catch (Exception ex)
             {
                 this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Render)} has faulted.", ex);
+            }
+        }
+
+        private void SetWaitingAtAudioGap(long expectedGeneration, CircularBuffer audioBuffer, bool isWaiting, TimeSpan gapEnd)
+        {
+            lock (SyncLock)
+            {
+                if (IsClosing.Value || expectedGeneration != SeekGeneration || !ReferenceEquals(AudioBuffer, audioBuffer))
+                    return;
+
+                Volatile.Write(ref m_WaitingAudioGapEndTicks, gapEnd.Ticks);
+                Volatile.Write(ref m_IsWaitingAtAudioGap, isWaiting ? 1 : 0);
             }
         }
 
@@ -511,8 +576,9 @@
                         continue;
                     }
 
+                    // Audio after a gap is written by the rendering worker once playback reaches it.
                     var blocks = MediaCore.Blocks[MediaType.Audio];
-                    if (blocks == null || blocks.ApproximateCount <= 0)
+                    if (blocks == null || blocks.ApproximateCount <= 0 || MediaCore.Workers?.Rendering.IsPlayingWithoutAudio == true)
                         continue;
 
                     var generation = SeekGeneration;

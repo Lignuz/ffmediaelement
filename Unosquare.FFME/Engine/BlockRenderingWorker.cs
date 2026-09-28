@@ -20,6 +20,7 @@ namespace Unosquare.FFME.Engine
     internal sealed class BlockRenderingWorker : WorkerBase, IMediaWorker, ILoggingSource
     {
         private static readonly TimeSpan MinimumSyncBufferLag = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan AudioGapTolerance = TimeSpan.FromMilliseconds(10);
         private static readonly TimeSpan MaximumSyncBufferDuration = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan SyncBufferRetryDelay = TimeSpan.FromSeconds(3);
         private static readonly TimeSpan WarningLogInterval = TimeSpan.FromSeconds(1);
@@ -38,6 +39,8 @@ namespace Unosquare.FFME.Engine
         private DateTime LastDecodeStarvationLogTime;
         private DateTime ClockResumedTime;
         private TimeSpan LastStaleVideoBlockStart = TimeSpan.MinValue;
+        private MediaType PlaybackMainType = MediaType.None;
+        private volatile bool m_IsPlayingWithoutAudio;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="BlockRenderingWorker"/> class.
@@ -81,6 +84,13 @@ namespace Unosquare.FFME.Engine
 
         /// <inheritdoc />
         ILoggingHandler ILoggingSource.LoggingHandler => MediaCore;
+
+        /// <summary>
+        /// Gets a value indicating whether the video plays without audio because the audio stream ended, or
+        /// has no decoded data at the playback position, while the video continues. Audio blocks are not
+        /// sent to the audio renderer in this state.
+        /// </summary>
+        internal bool IsPlayingWithoutAudio => m_IsPlayingWithoutAudio;
 
         /// <summary>
         /// Gets the Media Engine's commands.
@@ -140,11 +150,17 @@ namespace Unosquare.FFME.Engine
             }
         }
 
+        /// <summary>
+        /// Clears the video-only playback mode when seeking changes the available block ranges.
+        /// The next rendering cycle selects the reference from the new playback position.
+        /// </summary>
+        internal void ResetPlaybackMainType() => m_IsPlayingWithoutAudio = false;
+
         /// <inheritdoc />
         protected override void ExecuteCycleLogic(CancellationToken ct)
         {
             // Update Status Properties
-            var main = MediaCore.Timing.ReferenceType;
+            var main = UpdatePlaybackMainType();
             var all = MediaCore.Renderers.Keys.ToArray();
 
             // Ensure we have renderers ready and main blocks available
@@ -284,6 +300,122 @@ namespace Unosquare.FFME.Engine
         }
 
         /// <summary>
+        /// Updates and returns the component whose blocks drive the playback clock. Audio is the reference
+        /// for audio and video media. Once the audio stream has ended (or has a gap) while the video
+        /// continues, the video is played by its own blocks until decoded audio is available again at the
+        /// playback position.
+        /// </summary>
+        /// <returns>The media type that drives the playback clock.</returns>
+        private MediaType UpdatePlaybackMainType()
+        {
+            var main = MediaCore.Timing.ReferenceType;
+            if (Commands.IsSeeking)
+            {
+                m_IsPlayingWithoutAudio = false;
+                PlaybackMainType = main;
+                return main;
+            }
+
+            var video = Container.Components.Video;
+            if (main != MediaType.Audio || HasDisconnectedClocks || video == null || video.IsStillPictures)
+            {
+                m_IsPlayingWithoutAudio = false;
+                PlaybackMainType = main;
+                return main;
+            }
+
+            var position = MediaCore.PlaybackPosition;
+            var audioBlocks = MediaCore.Blocks[MediaType.Audio];
+            var videoBlocks = MediaCore.Blocks[MediaType.Video];
+            if (m_IsPlayingWithoutAudio)
+            {
+                if (IsAudioAvailableAt(position))
+                {
+                    // Restart the audio output from the block at the playback position.
+                    m_IsPlayingWithoutAudio = false;
+                    MediaCore.InvalidateRenderer(MediaType.Audio);
+                    this.LogInfo(Aspects.RenderingWorker, $"AUDIO RESUMED: playing with audio again at {position.Format()}.");
+                }
+            }
+            else if (videoBlocks is { Count: > 0 })
+            {
+                // An already decoded later audio block proves that the current silence is a
+                // timestamp gap. Do not wait for EOF or move the audio clock to that block.
+                if (HasVideoRangeAt(position) && HasDecodedAudioGapAt(position))
+                {
+                    m_IsPlayingWithoutAudio = true;
+                    this.LogInfo(Aspects.RenderingWorker, $"AUDIO GAP: playing the video without audio from {position.Format()}.");
+                }
+                else if (MediaCore.HasAudioDecodingEnded)
+                {
+                    // The audio can also end before the video without another audio block. The video
+                    // blocks need not cover the position yet: after a seek into the video-only part,
+                    // the video clock moves playback to the decoded video.
+                    var audioEndTime = audioBlocks?.Count > 0 ? audioBlocks.RangeEndTime : position;
+                    if (position >= audioEndTime && videoBlocks.RangeEndTime > audioEndTime)
+                    {
+                        m_IsPlayingWithoutAudio = true;
+                        this.LogInfo(Aspects.RenderingWorker, $"AUDIO END: playing the video without audio from {position.Format()}.");
+                    }
+                }
+            }
+
+            PlaybackMainType = m_IsPlayingWithoutAudio ? MediaType.Video : main;
+            return PlaybackMainType;
+
+            bool IsAudioAvailableAt(TimeSpan time)
+            {
+                if (audioBlocks == null || audioBlocks.Count <= 0)
+                    return false;
+
+                var block = audioBlocks[time.Ticks];
+                return block != null && block.StartTime <= time && time < block.EndTime;
+            }
+
+            bool HasVideoRangeAt(TimeSpan time) =>
+                videoBlocks.RangeStartTime <= time && time < videoBlocks.RangeEndTime;
+
+            bool HasDecodedAudioGapAt(TimeSpan time)
+            {
+                if (audioBlocks == null || audioBlocks.Count <= 0)
+                    return false;
+
+                var block = audioBlocks[time.Ticks];
+                if (block == null || (block.StartTime <= time && time < block.EndTime))
+                    return false;
+
+                if (block.StartTime > time)
+                    return block.StartTime - time > AudioGapTolerance;
+
+                var next = audioBlocks.Next(block);
+                return next != null && block.EndTime <= time && time < next.StartTime &&
+                    next.StartTime - block.EndTime > AudioGapTolerance;
+            }
+        }
+
+        /// <summary>
+        /// Determines whether decoded video frames cover the given position.
+        /// </summary>
+        /// <param name="position">The playback position.</param>
+        /// <returns>True if a video block range contains the position.</returns>
+        private bool IsVideoAvailableAt(TimeSpan position)
+        {
+            var video = Container.Components.Video;
+            var blocks = MediaCore.Blocks[MediaType.Video];
+            return video != null && !video.IsStillPictures && blocks?.Count > 0 &&
+                blocks.RangeStartTime <= position && position < blocks.RangeEndTime;
+        }
+
+        /// <summary>
+        /// Determines whether a secondary component has no content to wait for because the video is
+        /// played without audio.
+        /// </summary>
+        /// <param name="t">The secondary component type.</param>
+        /// <returns>True if the component has no content at the playback position.</returns>
+        private bool HasComponentEnded(MediaType t) =>
+            t == MediaType.Audio && m_IsPlayingWithoutAudio;
+
+        /// <summary>
         /// Ensures the real-time clocks do not lag or move beyond the range of their corresponding blocks.
         /// </summary>
         /// <param name="main">The main renderer component.</param>
@@ -371,14 +503,22 @@ namespace Unosquare.FFME.Engine
             }
             else if (position.Ticks > blocks.RangeEndTime.Ticks)
             {
-                // Don't let the RTC move beyond what is available on the main component
+                // Don't let the RTC move beyond what is available on the main component. When decoded
+                // video exists at the position (e.g. after a seek past the end of the audio), only wait:
+                // moving the clock back to the audio would lose the seek target before the video can
+                // take over (see UpdatePlaybackMainType).
                 var wasRunning = MediaCore.Timing.IsRunning;
                 MediaCore.PausePlayback();
-                MediaCore.ChangePlaybackPosition(blocks.RangeEndTime);
+                if (main != MediaType.Audio || !IsVideoAvailableAt(position))
+                    MediaCore.ChangePlaybackPosition(blocks.RangeEndTime);
 
                 // Reaching the end of the decoded content while decoding continues means the
-                // decoder could not keep up; at the end of the media it is expected.
-                if (wasRunning && !MediaCore.HasDecodingEnded)
+                // decoder could not keep up; at the end of the media it is expected, including the
+                // moment the last packets were decoded but the end of decoding is not flagged yet.
+                var isAtEndOfMedia = MediaCore.HasDecodingEnded ||
+                    (Container.IsAtEndOfStream && Container.Components[main]?.BufferCount == 0);
+
+                if (wasRunning && !isAtEndOfMedia)
                 {
                     ReportDecodeStarvation(
                         $"CLOCK PAUSED: playback clock reached the end of decoded {main} content at {position.Format()}");
@@ -416,7 +556,7 @@ namespace Unosquare.FFME.Engine
         private string DescribePipeline()
         {
             var now = DateTime.UtcNow;
-            var main = MediaCore.Timing.ReferenceType;
+            var main = PlaybackMainType == MediaType.None ? MediaCore.Timing.ReferenceType : PlaybackMainType;
             var blocks = MediaCore.Blocks[main];
             var component = Container.Components[main];
             var workers = MediaCore.Workers;
@@ -549,7 +689,7 @@ namespace Unosquare.FFME.Engine
 
             foreach (var t in all)
             {
-                if (t == MediaType.Subtitle || t == main)
+                if (t == MediaType.Subtitle || t == main || HasComponentEnded(t))
                     continue;
 
                 // We don't want to sync-buffer on attached pictures
@@ -590,9 +730,39 @@ namespace Unosquare.FFME.Engine
             if (audioPosition >= playbackPosition - tolerance)
                 return;
 
+            // Without decoded audio at the playback position (e.g. right after a seek past the end
+            // of the audio) the output cannot catch up; the audio end and gap handling covers it.
+            var blocks = MediaCore.Blocks[main];
+            if (blocks.Count <= 0 || playbackPosition >= blocks.RangeEndTime)
+                return;
+
+            // A timestamp gap leaves the audio output position at the previous block until
+            // the following block is written. Following it here would repeatedly rewind the
+            // playback clock, especially for audio-only media with no video clock to use.
+            var currentBlock = blocks[playbackPosition.Ticks];
+            if (currentBlock != null)
+            {
+                var nextBlock = blocks.Next(currentBlock);
+                if (currentBlock.StartTime > playbackPosition ||
+                    (currentBlock.EndTime <= playbackPosition && nextBlock != null &&
+                        playbackPosition < nextBlock.StartTime &&
+                        nextBlock.StartTime - currentBlock.EndTime > AudioGapTolerance))
+                {
+                    return;
+                }
+
+                var previousBlock = blocks.Previous(currentBlock);
+                if (previousBlock != null && currentBlock.StartTime <= playbackPosition &&
+                    playbackPosition < currentBlock.EndTime &&
+                    currentBlock.StartTime - previousBlock.EndTime > AudioGapTolerance &&
+                    audioPosition < currentBlock.StartTime)
+                {
+                    return;
+                }
+            }
+
             // Don't move the clock before the available main blocks; the clock alignment
             // would move it forward again on the next cycle.
-            var blocks = MediaCore.Blocks[main];
             var targetPosition = blocks.Count > 0 && audioPosition < blocks.RangeStartTime
                 ? blocks.RangeStartTime
                 : audioPosition;
@@ -659,7 +829,7 @@ namespace Unosquare.FFME.Engine
 
                 foreach (var t in all)
                 {
-                    if (t == MediaType.Subtitle || t == main)
+                    if (t == MediaType.Subtitle || t == main || HasComponentEnded(t))
                         continue;
 
                     // We don't want to consider sync-buffer on attached pictures
@@ -737,10 +907,22 @@ namespace Unosquare.FFME.Engine
                 if (Commands.HasPendingCommands && t != MediaType.Video)
                     return result > 0;
 
+                // While the video plays without audio, audio after a gap must not be written early.
+                if (t == MediaType.Audio && m_IsPlayingWithoutAudio)
+                    return result > 0;
+
                 // Get the audio, video, or subtitle block to render
                 var currentBlock = t == MediaType.Subtitle && MediaCore.PreloadedSubtitles != null
                     ? MediaCore.PreloadedSubtitles[playbackClock.Ticks]
                     : MediaCore.Blocks[t][playbackClock.Ticks];
+
+                // The lookup returns the last block when playback is past all decoded audio (e.g. after a
+                // seek past the end of the audio). That audio is stale and must not be played now.
+                if (t == MediaType.Audio && currentBlock != null &&
+                    playbackClock.Ticks - currentBlock.EndTime.Ticks > MinimumSyncBufferLag.Ticks)
+                {
+                    return result > 0;
+                }
 
                 if (t == MediaType.Video &&
                     MediaCore.Timing.ReferenceType == MediaType.Audio &&
@@ -837,11 +1019,14 @@ namespace Unosquare.FFME.Engine
                 return;
             }
 
-            // wait for packets
+            // A low frame rate stream may reach the read-ahead limit before the packet-count
+            // buffering target is met. If a decoded block can advance the clock, play it so
+            // the reader can move past that limit instead of waiting for more packets forever.
             if (MediaOptions.MinimumPlaybackBufferPercent > 0 &&
                 MediaCore.ShouldReadMorePackets &&
                 !Container.Components.HasEnoughPackets &&
-                State.BufferingProgress < Math.Min(1, MediaOptions.MinimumPlaybackBufferPercent))
+                State.BufferingProgress < Math.Min(1, MediaOptions.MinimumPlaybackBufferPercent) &&
+                !(MediaCore.HasReachedPacketReadAheadMax() && CanResumeClock(MediaType.None)))
             {
                 return;
             }
@@ -879,7 +1064,8 @@ namespace Unosquare.FFME.Engine
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool CanResumeClock(MediaType t)
         {
-            var blocks = MediaCore.Blocks[t == MediaType.None ? MediaCore.Timing.ReferenceType : t];
+            var main = PlaybackMainType == MediaType.None ? MediaCore.Timing.ReferenceType : PlaybackMainType;
+            var blocks = MediaCore.Blocks[t == MediaType.None ? main : t];
             if (blocks == null || blocks.Count <= 0)
                 return false;
 

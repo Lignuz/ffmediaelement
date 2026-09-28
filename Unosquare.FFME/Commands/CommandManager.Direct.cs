@@ -286,6 +286,7 @@
                 // This flag belongs to the media engine instance, so reset it
                 // when reusing the engine for a new media source.
                 MediaCore.HasDecodingEnded = false;
+                MediaCore.HasAudioDecodingEnded = false;
                 State.ResetAll();
                 State.UpdateSource(source);
 

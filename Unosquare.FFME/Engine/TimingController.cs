@@ -83,9 +83,19 @@
         public TimeSpan Position => GetPosition(ReferenceType);
 
         /// <summary>
-        /// Gets the duration of the reference component type.
+        /// Gets the duration of the media, from the start of the reference component to <see cref="EndTime"/>.
         /// </summary>
-        public TimeSpan? Duration => GetDuration(ReferenceType);
+        public TimeSpan? Duration
+        {
+            get
+            {
+                lock (SyncLock)
+                {
+                    var endTime = EndTime;
+                    return endTime.HasValue ? endTime.Value - StartTime : default(TimeSpan?);
+                }
+            }
+        }
 
         /// <summary>
         /// Gets the start time of the reference component type.
@@ -93,9 +103,32 @@
         public TimeSpan StartTime => GetStartTime(ReferenceType);
 
         /// <summary>
-        /// Gets the end time of the reference component type.
+        /// Gets the end time of the media. With audio as the reference, video that continues after
+        /// the audio has ended is included, so the remaining frames can be played and sought.
         /// </summary>
-        public TimeSpan? EndTime => GetEndTime(ReferenceType);
+        public TimeSpan? EndTime
+        {
+            get
+            {
+                lock (SyncLock)
+                {
+                    var endTime = GetEndTime(ReferenceType);
+                    var video = MediaCore?.Container?.Components?.Video;
+                    if (!IsReady || HasDisconnectedClocks || ReferenceType != MediaType.Audio ||
+                        video == null || video.IsStillPictures)
+                    {
+                        return endTime;
+                    }
+
+                    // Use whichever end is known when the other stream does not report a duration.
+                    var videoEndTime = GetEndTime(MediaType.Video);
+                    if (!endTime.HasValue || (videoEndTime.HasValue && videoEndTime.Value > endTime.Value))
+                        return videoEndTime;
+
+                    return endTime;
+                }
+            }
+        }
 
         /// <summary>
         /// Gets the media core.

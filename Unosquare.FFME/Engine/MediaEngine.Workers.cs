@@ -19,8 +19,16 @@
         /// </summary>
         internal const long BufferLengthMax = 16 * 1024 * 1024;
 
+        /// <summary>
+        /// How far past the playback position the reader may read an audio or video stream. Without it, a
+        /// stream that has no more packets (e.g. audio that ended before the video) makes the reader load
+        /// the rest of the file into memory.
+        /// </summary>
+        private static readonly TimeSpan PacketReadAheadMax = TimeSpan.FromSeconds(10);
+
         private readonly AtomicBoolean m_IsSyncBuffering = new AtomicBoolean(false);
         private readonly AtomicBoolean m_HasDecodingEnded = new AtomicBoolean(false);
+        private readonly AtomicBoolean m_HasAudioDecodingEnded = new AtomicBoolean(false);
 
         private DateTime SyncBufferStartTime = DateTime.UtcNow;
 
@@ -70,6 +78,18 @@
         {
             get => m_HasDecodingEnded.Value;
             set => m_HasDecodingEnded.Value = value;
+        }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the audio stream has ended (the file was read to its
+        /// end, or its packets stopped while the video continues) and all read audio was decoded.
+        /// Video may continue after this point. It is cleared by a seek, a new media source, or later
+        /// audio packets arriving after a temporary end was detected.
+        /// </summary>
+        internal bool HasAudioDecodingEnded
+        {
+            get => m_HasAudioDecodingEnded.Value;
+            set => m_HasAudioDecodingEnded.Value = value;
         }
 
         /// <summary>
@@ -239,6 +259,32 @@
             var mediaTypes = Renderers.Keys.ToArray();
             foreach (var t in mediaTypes)
                 InvalidateRenderer(t);
+        }
+
+        /// <summary>
+        /// Determines whether the packet reader should wait because an audio or video stream was already read
+        /// <see cref="PacketReadAheadMax"/> past the playback position. Packet timestamps are used since packet
+        /// durations may be unknown. Only the reader applies this limit; seek and end-of-stream detection
+        /// continue to use the container and decoder state.
+        /// </summary>
+        /// <returns>True if the reader should not read more packets for now.</returns>
+        internal bool HasReachedPacketReadAheadMax()
+        {
+            var components = Container?.Components;
+            if (components == null || Container.IsLiveStream)
+                return false;
+
+            // Network streams keep their minimum download buffer.
+            if (Container.IsNetworkStream && components.BufferLength < BufferLengthMax)
+                return false;
+
+            var position = PlaybackPosition;
+            return IsReadAhead(components.Audio) || IsReadAhead(components.Video);
+
+            bool IsReadAhead(MediaComponent component) =>
+                component != null && !component.IsStillPictures &&
+                component.LastPacketEndTime != TimeSpan.MinValue &&
+                component.LastPacketEndTime - position >= PacketReadAheadMax;
         }
 
         #endregion

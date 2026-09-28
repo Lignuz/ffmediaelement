@@ -35,6 +35,7 @@
         private bool IsNonMonotonic;
         private TimeSpan m_RangeStartTime;
         private TimeSpan m_RangeEndTime;
+        private long m_RangeEndTimeTicks;
         private TimeSpan m_RangeMidTime;
         private TimeSpan m_RangeDuration;
         private TimeSpan m_AverageBlockDuration;
@@ -108,6 +109,11 @@
         /// Gets the end time of the last block.
         /// </summary>
         public TimeSpan RangeEndTime { get { lock (SyncLock) return m_RangeEndTime; } }
+
+        /// <summary>
+        /// Gets a lock-free snapshot of the last decoded block end for the audio output callback.
+        /// </summary>
+        public TimeSpan ApproximateRangeEndTime => TimeSpan.FromTicks(Volatile.Read(ref m_RangeEndTimeTicks));
 
         /// <summary>
         /// Gets the range of time between the first block and the end time of the last block.
@@ -533,6 +539,7 @@
             m_Count = PlaybackBlocks.Count;
             m_RangeStartTime = PlaybackBlocks.Count == 0 ? TimeSpan.Zero : PlaybackBlocks[0].StartTime;
             m_RangeEndTime = PlaybackBlocks.Count == 0 ? TimeSpan.Zero : PlaybackBlocks[PlaybackBlocks.Count - 1].EndTime;
+            Volatile.Write(ref m_RangeEndTimeTicks, m_RangeEndTime.Ticks);
             m_RangeDuration = TimeSpan.FromTicks(RangeEndTime.Ticks - RangeStartTime.Ticks);
             m_RangeMidTime = TimeSpan.FromTicks(m_RangeStartTime.Ticks + (m_RangeDuration.Ticks / 2));
             m_CapacityPercent = Convert.ToDouble(m_Count) / Capacity;

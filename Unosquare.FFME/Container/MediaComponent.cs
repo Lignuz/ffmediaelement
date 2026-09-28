@@ -5,6 +5,7 @@
     using FFmpeg.AutoGen;
     using Primitives;
     using System;
+    using System.Collections.Generic;
     using System.Diagnostics;
     using System.Globalization;
     using System.Runtime.CompilerServices;
@@ -35,6 +36,16 @@
         private readonly PacketQueue Packets = new();
 
         /// <summary>
+        /// Keeps drain state changes ordered with packet queue changes across the reading and decoding workers.
+        /// </summary>
+        private readonly object m_DrainStateLock = new();
+
+        /// <summary>
+        /// Associates queued empty packets with the request that produced each one.
+        /// </summary>
+        private readonly Queue<long> m_QueuedDrainRequestIds = new();
+
+        /// <summary>
         /// The decode packet function.
         /// </summary>
         private readonly Func<MediaFrame> DecodePacketFunction;
@@ -50,9 +61,39 @@
         private readonly AtomicBoolean m_HasCodecPackets = new(false);
 
         /// <summary>
+        /// Holds the end time of the latest packet read into the queue.
+        /// </summary>
+        private readonly AtomicTimeSpan m_LastPacketEndTime = new(TimeSpan.MinValue);
+
+        /// <summary>
+        /// Holds whether an empty packet was queued after the last data packet.
+        /// </summary>
+        private readonly AtomicBoolean m_HasDrainRequest = new(false);
+
+        /// <summary>
+        /// Holds whether the decoder reported EOF after a drain request was queued.
+        /// </summary>
+        private readonly AtomicBoolean m_HasDrainCompleted = new(false);
+
+        /// <summary>
         /// Holds a reference to the associated input context stream.
         /// </summary>
         private readonly IntPtr m_Stream;
+
+        /// <summary>
+        /// Monotonic ID assigned to each queued drain packet.
+        /// </summary>
+        private long m_NextDrainRequestId;
+
+        /// <summary>
+        /// ID of the latest queued drain request.
+        /// </summary>
+        private long m_LatestDrainRequestId;
+
+        /// <summary>
+        /// ID of the drain packet accepted by the codec.
+        /// </summary>
+        private long m_AcceptedDrainRequestId;
 
         /// <summary>
         /// Holds a reference to the Codec Context.
@@ -402,6 +443,19 @@
         }
 
         /// <summary>
+        /// Gets the end time of the latest packet read into the queue since the queue was cleared
+        /// (e.g. by a seek). Returns <see cref="TimeSpan.MinValue"/> when no packet was read.
+        /// </summary>
+        public TimeSpan LastPacketEndTime => m_LastPacketEndTime.Value;
+
+        /// <summary>
+        /// Gets or sets a callback called while the drain state lock is held when data is queued or the queue is cleared.
+        /// The audio decoding worker uses this to invalidate an already reported audio end.
+        /// The argument is true when queued packets are cleared.
+        /// </summary>
+        public Action<bool> OnPacketSequenceChanged { get; set; }
+
+        /// <summary>
         /// Gets a value indicating whether this instance is disposed.
         /// </summary>
         public bool IsDisposed
@@ -427,7 +481,16 @@
         public void ClearQueuedPackets(bool flushBuffers)
         {
             // Release packets that are already in the queue.
-            Packets.Clear();
+            lock (m_DrainStateLock)
+            {
+                Packets.Clear();
+                m_QueuedDrainRequestIds.Clear();
+                m_AcceptedDrainRequestId = 0;
+                m_LastPacketEndTime.Value = TimeSpan.MinValue;
+                m_HasDrainRequest.Value = false;
+                m_HasDrainCompleted.Value = false;
+                OnPacketSequenceChanged?.Invoke(true);
+            }
 
             if (flushBuffers)
                 FlushCodecBuffers();
@@ -447,6 +510,33 @@
         }
 
         /// <summary>
+        /// Requests a decoder drain only if no request or unread packet is already pending.
+        /// </summary>
+        public void RequestDrainIfIdle()
+        {
+            var packet = MediaPacket.CreateEmptyPacket(Stream->index);
+            if (!QueuePacket(packet, true))
+                packet.Dispose();
+        }
+
+        /// <summary>
+        /// Reports a completed drain and publishes the audio end while packet enqueueing is excluded.
+        /// </summary>
+        /// <param name="markEnded">Publishes the last packet time and ended state.</param>
+        /// <returns>True if the current packet sequence was completely drained.</returns>
+        public bool TryMarkDrainCompleted(Action<TimeSpan> markEnded)
+        {
+            lock (m_DrainStateLock)
+            {
+                if (!m_HasDrainRequest.Value || !m_HasDrainCompleted.Value)
+                    return false;
+
+                markEnded(m_LastPacketEndTime.Value);
+                return true;
+            }
+        }
+
+        /// <summary>
         /// Pushes a packet into the decoding Packet Queue
         /// and processes the packet in order to try to decode
         /// 1 or more frames.
@@ -460,8 +550,7 @@
                 return;
             }
 
-            Packets.Push(packet);
-            Container.Components.ProcessPacketQueueChanges(PacketQueueOp.Queued, packet, MediaType);
+            QueuePacket(packet, false);
         }
 
         /// <summary>
@@ -549,6 +638,67 @@
         }
 
         /// <summary>
+        /// Queues a packet and updates the matching drain generation under one lock.
+        /// </summary>
+        /// <param name="packet">The packet to queue.</param>
+        /// <param name="requireIdle">Whether to reject the drain request when packets are pending.</param>
+        /// <returns>True if the packet was queued.</returns>
+        private bool QueuePacket(MediaPacket packet, bool requireIdle)
+        {
+            if (packet.IsFlushPacket)
+            {
+                Packets.Push(packet);
+            }
+            else
+            {
+                lock (m_DrainStateLock)
+                {
+                    if (requireIdle && (m_HasDrainRequest.Value || Packets.Count > 0 || HasPacketsInCodec))
+                        return false;
+
+                    // An empty packet asks the decoder to output the frames it holds. Do not treat
+                    // the request as completed until avcodec_receive_frame actually returns EOF.
+                    var isDrainPacket = packet.Size == 0 && packet.Pointer->data == null;
+                    m_HasDrainRequest.Value = isDrainPacket;
+                    m_HasDrainCompleted.Value = false;
+                    UpdateLastPacketEndTime(packet);
+                    if (isDrainPacket)
+                    {
+                        m_LatestDrainRequestId = ++m_NextDrainRequestId;
+                        m_QueuedDrainRequestIds.Enqueue(m_LatestDrainRequestId);
+                    }
+
+                    Packets.Push(packet);
+                    if (!isDrainPacket)
+                        OnPacketSequenceChanged?.Invoke(false);
+                }
+            }
+
+            Container.Components.ProcessPacketQueueChanges(PacketQueueOp.Queued, packet, MediaType);
+            return true;
+        }
+
+        /// <summary>
+        /// Records the end time of a packet read from the stream. Flush and empty packets carry no data
+        /// and are ignored. Presentation times of video packets are not in read order, so the latest is kept.
+        /// </summary>
+        /// <param name="packet">The packet.</param>
+        private void UpdateLastPacketEndTime(MediaPacket packet)
+        {
+            if (packet.IsFlushPacket || (packet.Size == 0 && packet.Pointer->data == null))
+                return;
+
+            var pointer = packet.Pointer;
+            var timestamp = pointer->pts != ffmpeg.AV_NOPTS_VALUE ? pointer->pts : pointer->dts;
+            if (timestamp == ffmpeg.AV_NOPTS_VALUE)
+                return;
+
+            var endTime = (timestamp + Math.Max(pointer->duration, 0)).ToTimeSpan(Stream->time_base);
+            if (endTime > m_LastPacketEndTime.Value)
+                m_LastPacketEndTime.Value = endTime;
+        }
+
+        /// <summary>
         /// Flushes the codec buffers.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -558,6 +708,11 @@
                 ffmpeg.avcodec_flush_buffers(CodecContext);
 
             HasPacketsInCodec = false;
+            lock (m_DrainStateLock)
+            {
+                m_AcceptedDrainRequestId = 0;
+                m_HasDrainCompleted.Value = false;
+            }
         }
 
         /// <summary>
@@ -588,6 +743,7 @@
 
                 // Send packet to the decoder but prevent null packets to be sent to it
                 // Null packets have never been detected but it's just a safeguard
+                var isDrainPacket = packet.Size == 0 && packet.Pointer->data == null;
                 var sendStart = Stopwatch.GetTimestamp();
                 sendPacketResult = packet.SafePointer != IntPtr.Zero
                     ? ffmpeg.avcodec_send_packet(CodecContext, packet.Pointer) : -ffmpeg.EINVAL;
@@ -598,7 +754,24 @@
                 if (sendPacketResult != -ffmpeg.EAGAIN)
                 {
                     // Dequeue the packet and release it.
-                    packet = Packets.Dequeue();
+                    if (isDrainPacket)
+                    {
+                        lock (m_DrainStateLock)
+                        {
+                            var requestId = m_QueuedDrainRequestIds.Dequeue();
+                            if (sendPacketResult >= 0 || sendPacketResult == ffmpeg.AVERROR_EOF)
+                                m_AcceptedDrainRequestId = requestId;
+                            else
+                                m_HasDrainRequest.Value = false;
+
+                            packet = Packets.Dequeue();
+                        }
+                    }
+                    else
+                    {
+                        packet = Packets.Dequeue();
+                    }
+
                     Container.Components.ProcessPacketQueueChanges(PacketQueueOp.Dequeued, packet, MediaType);
 
                     packet.Dispose();
@@ -608,7 +781,8 @@
                 if (sendPacketResult >= 0)
                     HasPacketsInCodec = true;
 
-                if (fillDecoderBuffer && sendPacketResult >= 0)
+                // The codec must be drained and flushed before any later data packet is sent.
+                if (fillDecoderBuffer && sendPacketResult >= 0 && !isDrainPacket)
                     continue;
 
                 break;
@@ -643,7 +817,21 @@
                 MediaFrame.ReleaseAVFrame(outputFrame);
 
             if (receiveFrameResult == ffmpeg.AVERROR_EOF)
+            {
+                long completedRequestId;
+                lock (m_DrainStateLock)
+                    completedRequestId = m_AcceptedDrainRequestId;
+
                 FlushCodecBuffers();
+                lock (m_DrainStateLock)
+                {
+                    // A new data packet or drain request may arrive while the old decoder is being
+                    // flushed. Its request ID must not be completed by the old decoder's EOF.
+                    if (completedRequestId != 0 && m_HasDrainRequest.Value &&
+                        completedRequestId == m_LatestDrainRequestId)
+                        m_HasDrainCompleted.Value = true;
+                }
+            }
 
             if (receiveFrameResult == -ffmpeg.EAGAIN)
                 HasPacketsInCodec = false;

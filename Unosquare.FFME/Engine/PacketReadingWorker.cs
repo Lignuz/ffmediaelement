@@ -62,7 +62,7 @@
         /// <inheritdoc />
         protected override void ExecuteCycleLogic(CancellationToken ct)
         {
-            while (MediaCore.ShouldReadMorePackets)
+            while (MediaCore.ShouldReadMorePackets && !MediaCore.HasReachedPacketReadAheadMax())
             {
                 if (Container.IsReadAborted || Container.IsAtEndOfStream || ct.IsCancellationRequested ||
                     WorkerState != WantedWorkerState)
