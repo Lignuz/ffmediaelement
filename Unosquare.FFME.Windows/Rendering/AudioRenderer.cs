@@ -294,6 +294,7 @@
             // We sync-lock the reads to avoid null reference exceptions as destroy might have been called
             var lockTaken = false;
             var shouldRaiseRenderingEvent = false;
+            var muteOutputAfterRenderingEvent = false;
             var startPosition = TimeSpan.Zero;
 
             if (IsClosing.Value)
@@ -383,6 +384,7 @@
                 }
 
                 ApplyVolumeAndBalance(targetBuffer, targetBufferOffset, requestedBytes);
+                muteOutputAfterRenderingEvent = MediaCore.State.IsMuted || IsClosing.Value;
                 Volatile.Write(ref m_LastReadableBytes, AudioBuffer.ReadableCount);
                 shouldRaiseRenderingEvent = true;
             }
@@ -415,6 +417,10 @@
                     this.LogError(Aspects.AudioRenderer, $"{nameof(AudioRenderer)}.{nameof(Read)} audio callback faulted.", ex);
                     Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
                 }
+
+                // Keep the volume-scaled signal available to visualizers while muting only device output.
+                if (muteOutputAfterRenderingEvent)
+                    Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
             }
 
             return requestedBytes;
@@ -1068,14 +1074,6 @@
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ApplyVolumeAndBalance(byte[] targetBuffer, int targetBufferOffset, int requestedBytes)
         {
-            // Check if we are muted. We don't need process volume and balance
-            var isMuted = MediaCore.State.IsMuted || IsClosing == true;
-            if (isMuted)
-            {
-                Array.Clear(targetBuffer, targetBufferOffset, requestedBytes);
-                return;
-            }
-
             // Capture and adjust volume and balance
             var volume = MediaCore.State.Volume;
             var balance = MediaCore.State.Balance;
